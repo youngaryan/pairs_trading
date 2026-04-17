@@ -70,24 +70,27 @@ class GeneralBacktester:
         
 if __name__ == "__main__":
     print("Downloading data...")
+    
+    TICK1 = "LOW"
+    TICK2 = "KO"
     # Fetching recent hourly data
-    prices = yf.download(["JPM", "NVDA"], start="2025-01-01", end="2026-02-01", interval="1h", progress=False)['Close']
+    prices = yf.download([TICK1, TICK2], start="2025-01-01", end="2026-04-17", interval="1d", progress=False)['Close']
     
     # Extract columns carefully to handle potential yfinance MultiIndex formatting
-    jpm_prices = prices["JPM"] if isinstance(prices, pd.DataFrame) else prices.xs('JPM', level=1, axis=1)
-    nvda_prices = prices["NVDA"] if isinstance(prices, pd.DataFrame) else prices.xs('NVDA', level=1, axis=1)
+    jpm_prices = prices[TICK1] if isinstance(prices, pd.DataFrame) else prices.xs('JPM', level=1, axis=1)
+    nvda_prices = prices[TICK2] if isinstance(prices, pd.DataFrame) else prices.xs('NVDA', level=1, axis=1)
 
     # 1. Instantiate the Strategy (The Indicator Logic)
-    # my_zscore_strategy = ZScorePairsStrategy(entry_z=2.0, exit_z=0.0, window=60)
-    kalman_strategy = KalmanPairsStrategy(entry_z=2.0, exit_z=0.0)
+    my_zscore_strategy = ZScorePairsStrategy(entry_z=2.0, exit_z=0.0, window=60)
+    # kalman_strategy = KalmanPairsStrategy(entry_z=2.0, exit_z=0.0)
     
     # 2. Instantiate the Backtester (The Execution Engine), passing the strategy into it
     backtester = GeneralBacktester(
-        ticker1="JPM", 
-        ticker2="NVDA", 
+        ticker1=TICK1, 
+        ticker2=TICK2, 
         price_series1=jpm_prices, 
         price_series2=nvda_prices,
-        strategy=kalman_strategy  # <--- Dependency Injection happens here!
+        strategy=my_zscore_strategy  # <--- Dependency Injection happens here!
     )
     
     # 3. Run and Plot

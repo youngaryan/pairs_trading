@@ -81,8 +81,8 @@ if __name__ == "__main__":
     # Run the screener
     cointegration_results = find_cointegrated_pairs(
         tickers=sector_tickers, 
-        start_date="2025-01-01", 
-        end_date="2026-04-17"
+        start_date="2012-01-01",
+        end_date="2024-12-30"
     )
     
     # Display the Top 10 most cointegrated pairs
