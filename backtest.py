@@ -11,51 +11,67 @@ warnings.filterwarnings("ignore")
 
 class GeneralBacktester:
     """
-    A generic backtesting engine. It doesn't know HOW signals are generated, 
-    it only cares about taking a Strategy object and evaluating its performance.
+    A universal backtesting engine. It evaluates ANY strategy, as long as the strategy's
+    `generate_signals` method returns a DataFrame containing 'position' and 'instrument_ret'.
     """
-    def __init__(self, ticker1: str, ticker2: str, price_series1: pd.Series, price_series2: pd.Series, strategy):
-        self.t1 = ticker1
-        self.t2 = ticker2
-        self.strategy = strategy  # Injects the strategy class!
-        
-        self.data = pd.DataFrame({self.t1: price_series1, self.t2: price_series2}).dropna()
-        self.hedge_ratio = None
+    def __init__(self, data: pd.DataFrame, strategy, name="Strategy"):
+        """
+        :param data: A pandas DataFrame containing whatever raw data the strategy needs.
+        :param strategy: An instantiated strategy class.
+        :param name: A display name for the plot.
+        """
+        self.data = data.copy()
+        self.strategy = strategy
+        self.name = name
 
     def run_backtest(self):
-        """Calculates the cumulative equity curve based on the injected strategy's signals."""
+        # 1. Ask the strategy to generate positions and underlying returns
+        self.data = self.strategy.generate_signals(self.data)
         
-        # Ask the injected strategy to calculate the positions and spread returns
-        self.data, self.hedge_ratio = self.strategy.generate_signals(self.data, self.t1, self.t2)
+        # Guardrail: Ensure the strategy followed the rules
+        if 'position' not in self.data.columns or 'instrument_ret' not in self.data.columns:
+            raise ValueError("The strategy must output a DataFrame with 'position' and 'instrument_ret' columns.")
+
+        # 2. Calculate Strategy Return: Yesterday's Position * Today's Return
+        self.data['strategy_ret'] = self.data['position'].shift(1) * self.data['instrument_ret']
         
-        # Core Strategy Return: Position from YESTERDAY * Spread Return TODAY (prevents lookahead bias)
-        self.data['strategy_ret'] = self.data['position'].shift(1) * self.data['spread_ret']
+        # 3. Calculate Cumulative Equity
         self.data['cumulative_ret'] = (1 + self.data['strategy_ret'].fillna(0)).cumprod()
-        
-        # Calculate Metrics
+        self.data['buy_and_hold_ret'] = (1 + self.data['instrument_ret'].fillna(0)).cumprod()
+
+        # 4. Performance Metrics
         total_return = (self.data['cumulative_ret'].iloc[-1] - 1) * 100
+        bnh_return = (self.data['buy_and_hold_ret'].iloc[-1] - 1) * 100
+        
         days_in_market = (self.data['position'] != 0).sum()
         pct_time_in_market = (days_in_market / len(self.data)) * 100
         
-        print(f"--- Backtest Results: {self.t1} vs {self.t2} ---")
-        print(f"Strategy Used:      {self.strategy.__class__.__name__}")
-        print(f"Total Return:       {total_return:.2f}%")
-        print(f"Time in Market:     {pct_time_in_market:.1f}%")
-        print(f"Hedge Ratio (Beta): {self.hedge_ratio:.4f}")
+        # Calculate Max Drawdown
+        rolling_max = self.data['cumulative_ret'].cummax()
+        drawdown = (self.data['cumulative_ret'] - rolling_max) / rolling_max
+        max_dd = drawdown.min() * 100
+
+        print(f"--- Backtest Results: {self.name} ---")
+        print(f"Strategy Model:   {self.strategy.__class__.__name__}")
+        print(f"Total Return:     {total_return:.2f}%")
+        print(f"Buy & Hold Ret:   {bnh_return:.2f}%")
+        print(f"Max Drawdown:     {max_dd:.2f}%")
+        print(f"Time in Market:   {pct_time_in_market:.1f}%")
         print("-" * 40)
         
         return self.data
 
     def plot_equity_curve(self):
-        """Visualizes the growth of the strategy over time."""
         if 'cumulative_ret' not in self.data.columns:
             print("Run backtest first!")
             return
             
         plt.figure(figsize=(10, 5))
-        plt.plot(self.data.index, self.data['cumulative_ret'], label=f'{self.t1}/{self.t2} Equity', color='green')
-        plt.axhline(1, color='gray', linestyle='--')
-        plt.title(f"Cumulative Return: {self.t1} vs {self.t2} ({self.strategy.__class__.__name__})")
+        plt.plot(self.data.index, self.data['cumulative_ret'], label=f'{self.name} Strategy', color='green')
+        plt.plot(self.data.index, self.data['buy_and_hold_ret'], label='Underlying Asset (Buy & Hold)', color='gray', alpha=0.5, linestyle='--')
+        plt.axhline(1, color='black', linestyle=':', alpha=0.3)
+        
+        plt.title(f"Cumulative Return: {self.name}")
         plt.xlabel("Date")
         plt.ylabel("Portfolio Multiplier")
         plt.legend()
@@ -65,34 +81,39 @@ class GeneralBacktester:
         
         
         
-        
-        
-        
+
 if __name__ == "__main__":
-    print("Downloading data...")
     
     TICK1 = "LOW"
-    TICK2 = "KO"
-    # Fetching recent hourly data
-    prices = yf.download([TICK1, TICK2], start="2025-01-01", end="2026-04-17", interval="1d", progress=False)['Close']
+    TICK2 = "KO" 
+       
+    print("1. Downloading Data for PEP and KO...")
+    # Download data
+    raw_data = yf.download(["PEP", "KO"], start="2018-01-01", end="2026-01-01", progress=False)
     
-    # Extract columns carefully to handle potential yfinance MultiIndex formatting
-    jpm_prices = prices[TICK1] if isinstance(prices, pd.DataFrame) else prices.xs('JPM', level=1, axis=1)
-    nvda_prices = prices[TICK2] if isinstance(prices, pd.DataFrame) else prices.xs('NVDA', level=1, axis=1)
+    # Flatten the yfinance MultiIndex dataframe to get clean columns
+    if isinstance(raw_data.columns, pd.MultiIndex):
+        price_df = raw_data['Close']
+    else:
+        price_df = raw_data
+        
+    price_df = price_df.dropna()
 
-    # 1. Instantiate the Strategy (The Indicator Logic)
-    my_zscore_strategy = ZScorePairsStrategy(entry_z=2.0, exit_z=0.0, window=60)
-    # kalman_strategy = KalmanPairsStrategy(entry_z=2.0, exit_z=0.0)
+    print("\n2. Testing Classic OLS Z-Score Strategy...")
+    # Instantiate strategy
+    zscore_strat = ZScorePairsStrategy(ticker1="PEP", ticker2="KO", entry_z=2.0, exit_z=0.0, window=60)
     
-    # 2. Instantiate the Backtester (The Execution Engine), passing the strategy into it
-    backtester = GeneralBacktester(
-        ticker1=TICK1, 
-        ticker2=TICK2, 
-        price_series1=jpm_prices, 
-        price_series2=nvda_prices,
-        strategy=my_zscore_strategy  # <--- Dependency Injection happens here!
-    )
+    # Run backtest
+    zscore_bt = GeneralBacktester(data=price_df, strategy=zscore_strat, name="PEP/KO OLS Z-Score")
+    zscore_bt.run_backtest()
+    zscore_bt.plot_equity_curve()
+
+
+    print("\n3. Testing Dynamic Kalman Filter Strategy...")
+    # Instantiate strategy (no window needed!)
+    kalman_strat = KalmanPairsStrategy(ticker1="PEP", ticker2="KO", entry_z=2.0, exit_z=0.0)
     
-    # 3. Run and Plot
-    backtester.run_backtest()
-    backtester.plot_equity_curve()
+    # Run backtest
+    kalman_bt = GeneralBacktester(data=price_df, strategy=kalman_strat, name="PEP/KO Kalman Filter")
+    kalman_bt.run_backtest()
+    kalman_bt.plot_equity_curve()

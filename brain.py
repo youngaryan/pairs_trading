@@ -8,175 +8,141 @@ import warnings
 # Suppress statsmodels warnings for a cleaner output
 warnings.filterwarnings("ignore")
 
-# ==========================================
-# 1. The Strategy / Indicator Classes
-# ==========================================
 class ZScorePairsStrategy:
-    """
-    A specific strategy class that implements the Z-Score mean reversion logic.
-    You can build other classes (e.g., BollingerBandsStrategy) that follow this same structure.
-    """
-    def __init__(self, entry_z: float = 2.0, exit_z: float = 0.0, window: int = 60):
+    """Classic OLS Z-Score Strategy adapted for the universal backtester."""
+    def __init__(self, ticker1: str, ticker2: str, entry_z: float = 2.0, exit_z: float = 0.0, window: int = 60):
+        self.t1 = ticker1
+        self.t2 = ticker2
         self.entry_z = entry_z
         self.exit_z = exit_z
         self.window = window
 
-    def generate_signals(self, data: pd.DataFrame, t1: str, t2: str):
-        """
-        Calculates the required indicators, determines the day-by-day positions,
-        and calculates the underlying spread returns.
-        """
-        df = data.copy()
+    def generate_signals(self, df: pd.DataFrame):
+        data = df.copy()
 
         # 1. Calculate Static Hedge Ratio via OLS
-        X = sm.add_constant(df[t2])
-        y = df[t1]
+        X = sm.add_constant(data[self.t2])
+        y = data[self.t1]
         model = sm.OLS(y, X).fit()
         hedge_ratio = model.params.iloc[1]
         
-        # 2. Calculate Spread and Z-Score
-        df['spread'] = df[t1] - (hedge_ratio * df[t2])
-        df['spread_mean'] = df['spread'].rolling(self.window).mean()
-        df['spread_std'] = df['spread'].rolling(self.window).std()
-        df['zscore'] = (df['spread'] - df['spread_mean']) / df['spread_std']
+        # 2. Spread & Z-Score
+        data['spread'] = data[self.t1] - (hedge_ratio * data[self.t2])
+        data['spread_mean'] = data['spread'].rolling(self.window).mean()
+        data['spread_std'] = data['spread'].rolling(self.window).std()
+        data['zscore'] = (data['spread'] - data['spread_mean']) / data['spread_std']
         
-        # 3. Simulate Positions (State Machine)
-        positions = np.zeros(len(df))
+        # 3. Positions
+        positions = np.zeros(len(data))
         current_pos = 0
-        
-        for i in range(len(df)):
-            z = df['zscore'].iloc[i]
+        for i in range(len(data)):
+            z = data['zscore'].iloc[i]
+            if pd.isna(z): continue
             
-            if pd.isna(z):
-                positions[i] = 0
-                continue
-                
             if current_pos == 0:
-                if z > self.entry_z:
-                    current_pos = -1 
-                elif z < -self.entry_z:
-                    current_pos = 1  
-            elif current_pos == 1:
-                if z >= -self.exit_z: 
-                    current_pos = 0
-            elif current_pos == -1:
-                if z <= self.exit_z:  
-                    current_pos = 0
-                    
+                if z > self.entry_z: current_pos = -1 
+                elif z < -self.entry_z: current_pos = 1  
+            elif current_pos == 1 and z >= -self.exit_z: current_pos = 0
+            elif current_pos == -1 and z <= self.exit_z: current_pos = 0
             positions[i] = current_pos
             
-        df['position'] = positions
+        data['position'] = positions
 
-        # 4. Calculate Spread Returns for the Backtester
-        df[f'{t1}_ret'] = df[t1].pct_change()
-        df[f'{t2}_ret'] = df[t2].pct_change()
-        df['spread_ret'] = df[f'{t1}_ret'] - (hedge_ratio * df[f'{t2}_ret'])
+        # 4. Universal Backtester Expectation: 'instrument_ret'
+        data[f'{self.t1}_ret'] = data[self.t1].pct_change()
+        data[f'{self.t2}_ret'] = data[self.t2].pct_change()
+        # The return of the spread is our "instrument" return
+        data['instrument_ret'] = data[f'{self.t1}_ret'] - (hedge_ratio * data[f'{self.t2}_ret'])
 
-        return df, hedge_ratio
-    
+        return data
+
 
 class KalmanPairsStrategy:
-    """
-    A strategy class that uses a dynamic Kalman Filter to estimate the hedge ratio,
-    spread, and Z-score tick-by-tick without relying on lookback windows.
-    """
-    def __init__(self, entry_z: float = 2.0, exit_z: float = 0.0):
-        # Notice we don't need a 'window' parameter anymore!
+    """Dynamic Kalman Filter Strategy adapted for the universal backtester."""
+    def __init__(self, ticker1: str, ticker2: str, entry_z: float = 2.0, exit_z: float = 0.0):
+        self.t1 = ticker1
+        self.t2 = ticker2
         self.entry_z = entry_z
         self.exit_z = exit_z
 
-    def generate_signals(self, data: pd.DataFrame, t1: str, t2: str):
-        df = data.copy()
+    def generate_signals(self, df: pd.DataFrame):
+        data = df.copy()
+        y = data[self.t1].values
+        x = data[self.t2].values
         
-        y = df[t1].values
-        x = df[t2].values
-        
-        # 1. Initialize Kalman Filter components
-        # Hidden state vector [alpha, beta]
         state_mean = np.zeros(2) 
         state_cov = np.ones((2, 2))
-        
-        # Noise parameters (Hyperparameters - tune these for faster/slower adaptation)
         delta = 1e-5
-        trans_cov = delta / (1 - delta) * np.eye(2) # How fast the state is allowed to change
-        obs_var = 1e-3 # Variance of the measurement noise
+        trans_cov = delta / (1 - delta) * np.eye(2) 
+        obs_var = 1e-3 
         
-        # Output arrays
-        hedge_ratios = np.zeros(len(df))
-        spreads = np.zeros(len(df))
-        zscores = np.zeros(len(df))
+        hedge_ratios = np.zeros(len(data))
+        zscores = np.zeros(len(data))
         
-        # 2. Run the Kalman Filter day by day
-        for t in range(len(df)):
-            # Observation matrix H_t = [1, x_t]
+        # Kalman Loop
+        for t in range(len(data)):
             H = np.array([1, x[t]])
-            
-            # Prediction Step (Assume state stays the same, uncertainty increases)
             state_cov = state_cov + trans_cov
-            
-            # Measurement Step
             y_pred = np.dot(H, state_mean)
-            
-            # The error between prediction and reality is our dynamically calculated spread
             error = y[t] - y_pred
-            spreads[t] = error
-            
-            # Calculate the variance of the prediction (Q)
             Q = np.dot(np.dot(H, state_cov), H.T) + obs_var
             
-            # The Z-score is natively derived from the filter's error and variance!
             zscores[t] = error / np.sqrt(Q)
-            
-            # Kalman Gain (How much should we update our state based on the error?)
             K = np.dot(state_cov, H.T) / Q
-            
-            # Update the hidden state [alpha, beta] and covariance
             state_mean = state_mean + K * error
             state_cov = state_cov - np.outer(K, np.dot(H, state_cov))
-            
-            # Store the current dynamic hedge ratio (beta)
             hedge_ratios[t] = state_mean[1]
 
-        # Attach to dataframe
-        df['hedge_ratio'] = hedge_ratios
-        df['spread'] = spreads
-        df['zscore'] = zscores
+        data['hedge_ratio'] = hedge_ratios
+        data['zscore'] = zscores
 
-        # 3. Simulate Positions (State Machine)
-        positions = np.zeros(len(df))
+        # Positions
+        positions = np.zeros(len(data))
         current_pos = 0
-        
-        for i in range(len(df)):
-            z = df['zscore'].iloc[i]
+        for i in range(len(data)):
+            z = data['zscore'].iloc[i]
+            if pd.isna(z) or i < 10: continue
             
-            # Give the filter ~10 days to "warm up" and find the true state
-            if pd.isna(z) or i < 10:
-                positions[i] = 0
-                continue
-                
             if current_pos == 0:
-                if z > self.entry_z:
-                    current_pos = -1 
-                elif z < -self.entry_z:
-                    current_pos = 1  
-            elif current_pos == 1:
-                if z >= -self.exit_z: 
-                    current_pos = 0
-            elif current_pos == -1:
-                if z <= self.exit_z:  
-                    current_pos = 0
-                    
+                if z > self.entry_z: current_pos = -1 
+                elif z < -self.entry_z: current_pos = 1  
+            elif current_pos == 1 and z >= -self.exit_z: current_pos = 0
+            elif current_pos == -1 and z <= self.exit_z: current_pos = 0
             positions[i] = current_pos
             
-        df['position'] = positions
+        data['position'] = positions
 
-        # 4. Calculate Spread Returns for the Backtester
-        df[f'{t1}_ret'] = df[t1].pct_change()
-        df[f'{t2}_ret'] = df[t2].pct_change()
+        # Universal Backtester Expectation: 'instrument_ret'
+        data[f'{self.t1}_ret'] = data[self.t1].pct_change()
+        data[f'{self.t2}_ret'] = data[self.t2].pct_change()
+        # Shift hedge ratio to avoid lookahead bias!
+        data['instrument_ret'] = data[f'{self.t1}_ret'] - (data['hedge_ratio'].shift(1) * data[f'{self.t2}_ret'])
+
+        return data
+    
+class MovingAverageCrossoverStrategy:
+    """
+    A single-asset trend following strategy.
+    Goes Long (+1) when Fast MA > Slow MA.
+    Goes Flat (0) when Fast MA < Slow MA.
+    """
+    def __init__(self, target_ticker: str, fast_window: int = 50, slow_window: int = 200):
+        self.target = target_ticker
+        self.fast = fast_window
+        self.slow = slow_window
+
+    def generate_signals(self, df: pd.DataFrame):
+        data = df.copy()
         
-        # CRITICAL: We use yesterday's hedge ratio to calculate today's return.
-        # If we used today's hedge ratio, we would introduce lookahead bias.
-        df['spread_ret'] = df[f'{t1}_ret'] - (df['hedge_ratio'].shift(1) * df[f'{t2}_ret'])
-
-        # Return the populated dataframe and the final hedge ratio for logging
-        return df, hedge_ratios[-1]
+        # 1. Calculate Indicators
+        data['fast_ma'] = data[self.target].rolling(self.fast).mean()
+        data['slow_ma'] = data[self.target].rolling(self.slow).mean()
+        
+        # 2. Determine Position
+        # np.where(condition, value_if_true, value_if_false)
+        data['position'] = np.where(data['fast_ma'] > data['slow_ma'], 1, 0)
+        
+        # 3. Supply the underlying instrument return for the backtester
+        data['instrument_ret'] = data[self.target].pct_change()
+        
+        return data
