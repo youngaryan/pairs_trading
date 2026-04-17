@@ -5,7 +5,7 @@ import statsmodels.api as sm
 import yfinance as yf
 import warnings
 
-from brain import ZScorePairsStrategy
+from brain import ZScorePairsStrategy, KalmanPairsStrategy
 
 warnings.filterwarnings("ignore")
 
@@ -78,7 +78,8 @@ if __name__ == "__main__":
     nvda_prices = prices["NVDA"] if isinstance(prices, pd.DataFrame) else prices.xs('NVDA', level=1, axis=1)
 
     # 1. Instantiate the Strategy (The Indicator Logic)
-    my_zscore_strategy = ZScorePairsStrategy(entry_z=2.0, exit_z=0.0, window=60)
+    # my_zscore_strategy = ZScorePairsStrategy(entry_z=2.0, exit_z=0.0, window=60)
+    kalman_strategy = KalmanPairsStrategy(entry_z=2.0, exit_z=0.0)
     
     # 2. Instantiate the Backtester (The Execution Engine), passing the strategy into it
     backtester = GeneralBacktester(
@@ -86,7 +87,7 @@ if __name__ == "__main__":
         ticker2="NVDA", 
         price_series1=jpm_prices, 
         price_series2=nvda_prices,
-        strategy=my_zscore_strategy  # <--- Dependency Injection happens here!
+        strategy=kalman_strategy  # <--- Dependency Injection happens here!
     )
     
     # 3. Run and Plot
