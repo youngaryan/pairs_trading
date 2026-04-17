@@ -5,7 +5,7 @@ import statsmodels.api as sm
 import yfinance as yf
 import warnings
 
-from brain import ZScorePairsStrategy, KalmanPairsStrategy
+from brain import ZScorePairsStrategy, KalmanPairsStrategy, MovingAverageCrossoverStrategy, BollingerBandsStrategy, DonchianBreakoutStrategy, MachineLearningStrategy,WalkForwardMLStrategy,HurstMetaStrategy
 
 warnings.filterwarnings("ignore")
 
@@ -80,40 +80,64 @@ class GeneralBacktester:
         plt.show()
         
         
-        
-
 if __name__ == "__main__":
     
-    TICK1 = "LOW"
-    TICK2 = "KO" 
-       
-    print("1. Downloading Data for PEP and KO...")
-    # Download data
-    raw_data = yf.download(["PEP", "KO"], start="2018-01-01", end="2026-01-01", progress=False)
+    TICK = "CVX"
+    print(f"1. Downloading Data for {TICK}...")
+    raw_data = yf.download(TICK, start="2025-01-01",interval="1h", end="2026-04-01", progress=False)
     
-    # Flatten the yfinance MultiIndex dataframe to get clean columns
     if isinstance(raw_data.columns, pd.MultiIndex):
         price_df = raw_data['Close']
     else:
-        price_df = raw_data
+        price_df = raw_data[['Close']].rename(columns={'Close': TICK})
         
     price_df = price_df.dropna()
 
-    print("\n2. Testing Classic OLS Z-Score Strategy...")
-    # Instantiate strategy
-    zscore_strat = ZScorePairsStrategy(ticker1="PEP", ticker2="KO", entry_z=2.0, exit_z=0.0, window=60)
-    
-    # Run backtest
-    zscore_bt = GeneralBacktester(data=price_df, strategy=zscore_strat, name="PEP/KO OLS Z-Score")
-    zscore_bt.run_backtest()
-    zscore_bt.plot_equity_curve()
+    print("\n2. Testing Bollinger Bands Strategy...")
+    bb_strat = BollingerBandsStrategy(target_ticker=TICK, window=20, num_std=2.0)
+    bb_bt = GeneralBacktester(data=price_df, strategy=bb_strat, name="TICK Bollinger Bands")
+    bb_bt.run_backtest()
+    bb_bt.plot_equity_curve()
 
-
-    print("\n3. Testing Dynamic Kalman Filter Strategy...")
-    # Instantiate strategy (no window needed!)
-    kalman_strat = KalmanPairsStrategy(ticker1="PEP", ticker2="KO", entry_z=2.0, exit_z=0.0)
+    print("\n3. Testing Donchian Breakout Strategy...")
+    turtle_strat = DonchianBreakoutStrategy(target_ticker=TICK, entry_window=20)
+    turtle_bt = GeneralBacktester(data=price_df, strategy=turtle_strat, name=f"{TICK} Donchian Breakout")
+    turtle_bt.run_backtest()
+    turtle_bt.plot_equity_curve()
     
-    # Run backtest
-    kalman_bt = GeneralBacktester(data=price_df, strategy=kalman_strat, name="PEP/KO Kalman Filter")
-    kalman_bt.run_backtest()
-    kalman_bt.plot_equity_curve()
+    print("\n4. Testing Moving Average Strategy...")
+    ma_strategy = MovingAverageCrossoverStrategy(target_ticker=TICK, fast_window=50, slow_window=200)
+
+    # 3. Instantiate and run the Backtester
+    backtester = GeneralBacktester(
+        data=price_df, 
+        strategy=ma_strategy, 
+        name="SPY Trend Follower"
+    )
+    
+    backtester.run_backtest()
+    backtester.plot_equity_curve()
+    
+    
+    print("\n5. Training and Backtesting the Random Forest Model...")
+    # Train on the first 1000 days (~4 years), then trade on the remaining time
+    ml_strat = MachineLearningStrategy(target_ticker=TICK, train_window_days=1000)
+    
+    ml_bt = GeneralBacktester(data=price_df, strategy=ml_strat, name=f"{TICK} Random Forest AI")
+    ml_bt.run_backtest()
+    ml_bt.plot_equity_curve()
+    
+    print("\n6. Backtesting Walk-Forward ML Strategy (This may take a moment)...")
+    # Retrains a fresh AI model every 60 trading days (~3 months)
+    wf_ml_strat = WalkForwardMLStrategy(target_ticker=TICK, train_window=1000, step_size=60)
+    
+    wf_bt = GeneralBacktester(data=price_df, strategy=wf_ml_strat, name=f"{TICK} Walk-Forward AI")
+    wf_bt.run_backtest()
+    wf_bt.plot_equity_curve()
+    
+    print("\n7. Backtesting the Hurst Meta-Strategy (This will take a minute or two)...")
+    hurst_strat = HurstMetaStrategy(target_ticker=TICK, hurst_window=60)
+    
+    hurst_bt = GeneralBacktester(data=price_df, strategy=hurst_strat, name=f"{TICK} Hurst Regime Switcher")
+    hurst_bt.run_backtest()
+    hurst_bt.plot_equity_curve()
