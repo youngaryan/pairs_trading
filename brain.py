@@ -5,6 +5,7 @@ import statsmodels.api as sm
 import yfinance as yf
 import warnings
 from sklearn.ensemble import RandomForestClassifier
+from hmmlearn.hmm import GaussianHMM
 
 # Suppress statsmodels warnings for a cleaner output
 warnings.filterwarnings("ignore")
@@ -518,3 +519,80 @@ class HurstMetaStrategy:
         data['instrument_ret'] = data[self.target].pct_change()
         
         return data
+    
+class HMMRegimeStrategy:
+    """
+    Uses a Gaussian Hidden Markov Model to classify the market into 2 hidden states.
+    It goes Long in the low-volatility state, and moves to Cash in the high-volatility state.
+    """
+    def __init__(self, target_ticker: str, train_window: int = 1000):
+        self.target = target_ticker
+        self.train_window = train_window
+
+    def generate_signals(self, df: pd.DataFrame):
+        data = df.copy()
+        
+        # 1. Feature Engineering: Returns and Volatility
+        data['returns'] = data[self.target].pct_change()
+        data['volatility'] = data['returns'].rolling(20).std()
+        model_data = data.dropna()
+        
+        # 2. Train the HMM on the initial window
+        train_data = model_data.iloc[:self.train_window][['returns', 'volatility']].values
+        
+        # We assume 2 market regimes (e.g., Bull and Bear)
+        hmm_model = GaussianHMM(n_components=2, covariance_type="full", n_iter=100, random_state=42)
+        hmm_model.fit(train_data)
+        
+        # Determine which hidden state is the "safe" state (the one with lower variance)
+        variances = [np.diag(hmm_model.covars_[i]).sum() for i in range(2)]
+        safe_state = np.argmin(variances)
+        
+        # 3. Predict the hidden states for the entire timeline
+        all_features = model_data[['returns', 'volatility']].values
+        hidden_states = hmm_model.predict(all_features)
+        
+        # 4. Position Sizing: 1 if in the safe state, 0 if in the danger state
+        positions = np.where(hidden_states == safe_state, 1, 0)
+        
+        # Shift positions by 1 to prevent lookahead bias (trade tomorrow based on today's state)
+        model_data['position'] = pd.Series(positions, index=model_data.index).shift(1).fillna(0)
+        model_data['instrument_ret'] = model_data['returns']
+        
+        return model_data
+    
+class TargetVolatilityStrategy:
+    """
+    A trend-following strategy that dynamically sizes its position based on rolling volatility.
+    Instead of binary (1 or 0), the position size is continuous (e.g., 0.4, 1.2).
+    """
+    def __init__(self, target_ticker: str, target_vol_annual: float = 0.15, trend_window: int = 100):
+        self.target = target_ticker
+        self.target_vol = target_vol_annual
+        self.trend_window = trend_window
+
+    def generate_signals(self, df: pd.DataFrame):
+        data = df.copy()
+        
+        # 1. Calculate Daily Returns and Annualized Rolling Volatility
+        data['returns'] = data[self.target].pct_change()
+        # 20-day rolling standard deviation, multiplied by sqrt(252) trading days
+        data['rolling_vol_annual'] = data['returns'].rolling(20).std() * np.sqrt(252)
+        
+        # 2. Trend Filter (Only be long if price is above the 100-day moving average)
+        data['sma'] = data[self.target].rolling(self.trend_window).mean()
+        data['trend_is_up'] = np.where(data[self.target] > data['sma'], 1, 0)
+        
+        # 3. Calculate Volatility Scalar (Target Vol / Current Vol)
+        # Cap the maximum leverage at 2.0 to avoid blowing up on zero-volatility days
+        data['vol_scalar'] = (self.target_vol / data['rolling_vol_annual']).clip(upper=2.0)
+        
+        # 4. Final Position = Trend Direction * Volatility Scalar
+        # If trend is down, position is 0. If trend is up, position scales dynamically.
+        data['position'] = data['trend_is_up'] * data['vol_scalar']
+        
+        # Shift to avoid lookahead bias
+        data['position'] = data['position'].shift(1).fillna(0)
+        data['instrument_ret'] = data['returns']
+        
+        return data.dropna()
