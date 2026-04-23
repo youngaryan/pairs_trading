@@ -1,0 +1,636 @@
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+from dataclasses import asdict, dataclass
+from hashlib import sha256
+import json
+from pathlib import Path
+import re
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
+from typing import Sequence
+
+import pandas as pd
+
+from .sentiment import BaseSentimentModel, NewsSentimentAggregator
+
+
+@dataclass(frozen=True)
+class NewsRequest:
+    tickers: tuple[str, ...]
+    start: str
+    end: str
+
+    @classmethod
+    def from_inputs(
+        cls,
+        tickers: Sequence[str],
+        start: str | pd.Timestamp,
+        end: str | pd.Timestamp,
+    ) -> "NewsRequest":
+        normalized = tuple(dict.fromkeys(str(ticker).upper() for ticker in tickers))
+        return cls(
+            tickers=normalized,
+            start=str(pd.Timestamp(start).strftime("%Y-%m-%d")),
+            end=str(pd.Timestamp(end).strftime("%Y-%m-%d")),
+        )
+
+    def cache_key(self, extra: dict[str, str] | None = None) -> str:
+        payload = asdict(self)
+        if extra:
+            payload["extra"] = extra
+        encoded = json.dumps(payload, sort_keys=True)
+        return sha256(encoded.encode("utf-8")).hexdigest()[:16]
+
+
+class HeadlineProvider(ABC):
+    @abstractmethod
+    def get_headlines(
+        self,
+        tickers: Sequence[str],
+        start: str | pd.Timestamp,
+        end: str | pd.Timestamp,
+    ) -> pd.DataFrame:
+        """
+        Return headline rows with at least:
+        - timestamp
+        - ticker
+        - headline
+        Optional:
+        - relevance
+        - source
+        - url
+        """
+
+
+class DailySentimentProvider(ABC):
+    @abstractmethod
+    def get_daily_sentiment(
+        self,
+        tickers: Sequence[str],
+        start: str | pd.Timestamp,
+        end: str | pd.Timestamp,
+    ) -> pd.DataFrame:
+        """
+        Return rows with:
+        - date
+        - ticker
+        - sentiment_score
+        - sentiment_abs
+        - confidence
+        - article_count
+        - positive_prob / negative_prob / neutral_prob
+        """
+
+
+@dataclass(frozen=True)
+class HeadlineDedupConfig:
+    enabled: bool = True
+    time_window_minutes: int = 180
+    min_text_key_length: int = 24
+
+
+def _normalize_text_key(text: str) -> str:
+    normalized = re.sub(r"[^a-z0-9]+", " ", str(text).lower()).strip()
+    return re.sub(r"\s+", " ", normalized)
+
+
+def _as_sorted_csv(values: set[str]) -> str:
+    return ",".join(sorted(value for value in values if value))
+
+
+def deduplicate_headlines(headlines: pd.DataFrame, config: HeadlineDedupConfig = HeadlineDedupConfig()) -> pd.DataFrame:
+    if headlines.empty or not config.enabled:
+        return headlines.sort_values(["timestamp", "ticker"]).reset_index(drop=True)
+
+    frame = headlines.copy()
+    frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=False).dt.tz_localize(None)
+    frame["ticker"] = frame["ticker"].astype(str).str.upper()
+    frame["headline"] = frame["headline"].astype(str)
+    if "source" not in frame.columns:
+        frame["source"] = ""
+    frame["source"] = frame["source"].fillna("").astype(str)
+    if "provider_name" not in frame.columns:
+        frame["provider_name"] = frame["source"]
+    frame["provider_name"] = frame["provider_name"].fillna("").astype(str)
+    if "url" not in frame.columns:
+        frame["url"] = ""
+    frame["url"] = frame["url"].fillna("").astype(str)
+    if "relevance" not in frame.columns:
+        frame["relevance"] = 1.0
+    frame["relevance"] = pd.to_numeric(frame["relevance"], errors="coerce").fillna(1.0)
+    if "title" not in frame.columns:
+        frame["title"] = frame["headline"]
+    frame["title"] = frame["title"].fillna("").astype(str)
+    if "summary" not in frame.columns:
+        frame["summary"] = ""
+    frame["summary"] = frame["summary"].fillna("").astype(str)
+
+    frame["_url_key"] = frame["url"].str.strip().str.lower()
+    frame["_text_key"] = frame["title"].where(frame["title"].str.len() > 0, frame["headline"]).map(_normalize_text_key)
+    frame.loc[frame["_text_key"].str.len() < config.min_text_key_length, "_text_key"] = ""
+
+    frame = frame.sort_values(["ticker", "timestamp", "relevance"], ascending=[True, True, False]).reset_index(drop=True)
+    time_window = pd.Timedelta(minutes=config.time_window_minutes)
+
+    merged_rows: list[dict[str, object]] = []
+    url_map: dict[tuple[str, str], int] = {}
+    text_map: dict[tuple[str, str], dict[str, object]] = {}
+
+    for row in frame.to_dict("records"):
+        ticker = str(row["ticker"])
+        timestamp = pd.Timestamp(row["timestamp"])
+        url_key = str(row["_url_key"])
+        text_key = str(row["_text_key"])
+
+        match_idx: int | None = None
+        if url_key:
+            match_idx = url_map.get((ticker, url_key))
+
+        if match_idx is None and text_key:
+            text_state = text_map.get((ticker, text_key))
+            if text_state is not None:
+                last_timestamp = pd.Timestamp(text_state["last_timestamp"])
+                if abs(timestamp - last_timestamp) <= time_window:
+                    match_idx = int(text_state["idx"])
+
+        if match_idx is None:
+            new_row = {key: value for key, value in row.items() if not key.startswith("_")}
+            sources = {str(new_row.get("source", ""))} if new_row.get("source") else set()
+            providers = {str(new_row.get("provider_name", ""))} if new_row.get("provider_name") else set()
+            urls = {str(new_row.get("url", ""))} if new_row.get("url") else set()
+            new_row["source_list"] = _as_sorted_csv(sources)
+            new_row["provider_list"] = _as_sorted_csv(providers)
+            new_row["url_list"] = _as_sorted_csv(urls)
+            new_row["source_count"] = len(sources) or 1
+            new_row["duplicate_count"] = 1
+            merged_rows.append(new_row)
+            match_idx = len(merged_rows) - 1
+        else:
+            existing = merged_rows[match_idx]
+            if len(str(row.get("headline", ""))) > len(str(existing.get("headline", ""))):
+                existing["headline"] = row["headline"]
+            if len(str(row.get("title", ""))) > len(str(existing.get("title", ""))):
+                existing["title"] = row["title"]
+            if len(str(row.get("summary", ""))) > len(str(existing.get("summary", ""))):
+                existing["summary"] = row["summary"]
+            existing["relevance"] = max(float(existing.get("relevance", 1.0)), float(row.get("relevance", 1.0)))
+            existing["timestamp"] = min(pd.Timestamp(existing["timestamp"]), timestamp)
+
+            source_set = set(filter(None, str(existing.get("source_list", "")).split(",")))
+            provider_set = set(filter(None, str(existing.get("provider_list", "")).split(",")))
+            url_set = set(filter(None, str(existing.get("url_list", "")).split(",")))
+            if row.get("source"):
+                source_set.add(str(row["source"]))
+            if row.get("provider_name"):
+                provider_set.add(str(row["provider_name"]))
+            if row.get("url"):
+                url_set.add(str(row["url"]))
+
+            existing["source_list"] = _as_sorted_csv(source_set)
+            existing["provider_list"] = _as_sorted_csv(provider_set)
+            existing["url_list"] = _as_sorted_csv(url_set)
+            existing["source_count"] = len(source_set) if source_set else 1
+            existing["duplicate_count"] = int(existing.get("duplicate_count", 1)) + 1
+            if not existing.get("source") and row.get("source"):
+                existing["source"] = row["source"]
+            if not existing.get("provider_name") and row.get("provider_name"):
+                existing["provider_name"] = row["provider_name"]
+            if not existing.get("url") and row.get("url"):
+                existing["url"] = row["url"]
+
+        if url_key:
+            url_map[(ticker, url_key)] = match_idx
+        if text_key:
+            text_map[(ticker, text_key)] = {"idx": match_idx, "last_timestamp": timestamp}
+
+    merged = pd.DataFrame(merged_rows)
+    if merged.empty:
+        return merged
+    merged["timestamp"] = pd.to_datetime(merged["timestamp"], utc=False).dt.tz_localize(None)
+    merged["ticker"] = merged["ticker"].astype(str).str.upper()
+    return merged.sort_values(["timestamp", "ticker"]).reset_index(drop=True)
+
+
+class RemoteHeadlineProvider(HeadlineProvider):
+    def __init__(self, timeout_seconds: float = 30.0) -> None:
+        self.timeout_seconds = timeout_seconds
+
+    def _fetch_json(self, url: str, params: dict[str, str], headers: dict[str, str] | None = None) -> dict | list:
+        query = urlencode({key: value for key, value in params.items() if value not in (None, "")})
+        full_url = f"{url}?{query}" if query else url
+        request = Request(full_url, headers=headers or {})
+        with urlopen(request, timeout=self.timeout_seconds) as response:
+            payload = response.read().decode("utf-8")
+        return json.loads(payload)
+
+
+class AlphaVantageNewsProvider(RemoteHeadlineProvider):
+    """
+    Official docs:
+    https://www.alphavantage.co/documentation/
+
+    Uses the NEWS_SENTIMENT endpoint:
+    - function=NEWS_SENTIMENT
+    - optional tickers, topics, time_from, time_to, sort, limit
+    """
+
+    BASE_URL = "https://www.alphavantage.co/query"
+
+    def __init__(
+        self,
+        api_key: str,
+        topics: Sequence[str] | None = None,
+        sort: str = "LATEST",
+        limit: int = 200,
+        timeout_seconds: float = 30.0,
+    ) -> None:
+        super().__init__(timeout_seconds=timeout_seconds)
+        self.api_key = api_key
+        self.topics = list(topics or [])
+        self.sort = sort
+        self.limit = min(max(int(limit), 1), 1000)
+
+    def get_headlines(
+        self,
+        tickers: Sequence[str],
+        start: str | pd.Timestamp,
+        end: str | pd.Timestamp,
+    ) -> pd.DataFrame:
+        request = NewsRequest.from_inputs(tickers=tickers, start=start, end=end)
+        params = {
+            "function": "NEWS_SENTIMENT",
+            "tickers": ",".join(request.tickers),
+            "topics": ",".join(self.topics),
+            "time_from": pd.Timestamp(request.start).strftime("%Y%m%dT0000"),
+            "time_to": pd.Timestamp(request.end).strftime("%Y%m%dT2359"),
+            "sort": self.sort,
+            "limit": str(self.limit),
+            "apikey": self.api_key,
+        }
+        payload = self._fetch_json(self.BASE_URL, params)
+        if not isinstance(payload, dict):
+            raise ValueError("Unexpected Alpha Vantage payload type.")
+        if "Note" in payload:
+            raise RuntimeError(f"Alpha Vantage rate limit or usage notice: {payload['Note']}")
+        if "Information" in payload:
+            raise RuntimeError(f"Alpha Vantage information message: {payload['Information']}")
+        if "Error Message" in payload:
+            raise RuntimeError(f"Alpha Vantage error: {payload['Error Message']}")
+
+        feed = payload.get("feed", [])
+        rows: list[dict[str, object]] = []
+        requested = set(request.tickers)
+        for item in feed:
+            timestamp = pd.to_datetime(item.get("time_published"), format="%Y%m%dT%H%M%S", errors="coerce")
+            title = str(item.get("title", "")).strip()
+            summary = str(item.get("summary", "")).strip()
+            text = " ".join(part for part in (title, summary) if part)
+
+            ticker_sentiment = item.get("ticker_sentiment") or []
+            matched = False
+            for ticker_info in ticker_sentiment:
+                ticker = str(ticker_info.get("ticker", "")).upper()
+                if ticker not in requested:
+                    continue
+                rows.append(
+                    {
+                        "timestamp": timestamp,
+                        "ticker": ticker,
+                        "headline": text,
+                        "title": title,
+                        "summary": summary,
+                        "source": item.get("source"),
+                        "url": item.get("url"),
+                        "relevance": float(ticker_info.get("relevance_score", 1.0) or 1.0),
+                        "provider_sentiment_score": float(item.get("overall_sentiment_score", 0.0) or 0.0),
+                        "provider_sentiment_label": item.get("overall_sentiment_label"),
+                    }
+                )
+                matched = True
+
+            if not matched and len(requested) == 1:
+                ticker = next(iter(requested))
+                rows.append(
+                    {
+                        "timestamp": timestamp,
+                        "ticker": ticker,
+                        "headline": text,
+                        "title": title,
+                        "summary": summary,
+                        "source": item.get("source"),
+                        "url": item.get("url"),
+                        "relevance": 1.0,
+                        "provider_sentiment_score": float(item.get("overall_sentiment_score", 0.0) or 0.0),
+                        "provider_sentiment_label": item.get("overall_sentiment_label"),
+                    }
+                )
+
+        frame = pd.DataFrame(rows)
+        if frame.empty:
+            return pd.DataFrame(columns=["timestamp", "ticker", "headline", "relevance", "source", "url"])
+
+        frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=False).dt.tz_localize(None)
+        frame["ticker"] = frame["ticker"].astype(str).str.upper()
+        return frame.sort_values(["timestamp", "ticker"]).reset_index(drop=True)
+
+
+class BenzingaNewsProvider(RemoteHeadlineProvider):
+    """
+    Official docs:
+    https://docs.benzinga.com/api-reference/news-api/get-news-items
+
+    Uses:
+    - GET /api/v2/news
+    - token query parameter
+    - dateFrom / dateTo / tickers / page / pageSize / displayOutput
+    """
+
+    BASE_URL = "https://api.benzinga.com/api/v2/news"
+
+    def __init__(
+        self,
+        api_key: str,
+        display_output: str = "abstract",
+        page_size: int = 100,
+        max_pages: int = 5,
+        timeout_seconds: float = 30.0,
+    ) -> None:
+        super().__init__(timeout_seconds=timeout_seconds)
+        self.api_key = api_key
+        self.display_output = display_output
+        self.page_size = min(max(int(page_size), 1), 100)
+        self.max_pages = max(int(max_pages), 1)
+
+    def get_headlines(
+        self,
+        tickers: Sequence[str],
+        start: str | pd.Timestamp,
+        end: str | pd.Timestamp,
+    ) -> pd.DataFrame:
+        request = NewsRequest.from_inputs(tickers=tickers, start=start, end=end)
+        requested = set(request.tickers)
+        rows: list[dict[str, object]] = []
+
+        for page in range(self.max_pages):
+            params = {
+                "token": self.api_key,
+                "tickers": ",".join(request.tickers),
+                "dateFrom": request.start,
+                "dateTo": request.end,
+                "page": str(page),
+                "pageSize": str(self.page_size),
+                "displayOutput": self.display_output,
+            }
+            payload = self._fetch_json(self.BASE_URL, params, headers={"accept": "application/json"})
+            if not isinstance(payload, list):
+                raise ValueError("Unexpected Benzinga payload type.")
+            if not payload:
+                break
+
+            for item in payload:
+                title = str(item.get("title", "")).strip()
+                teaser = str(item.get("teaser", "")).strip()
+                body = str(item.get("body", "")).strip()
+                text = " ".join(part for part in (title, teaser, body) if part)
+                timestamp = pd.to_datetime(item.get("created"), errors="coerce")
+                stocks = item.get("stocks") or []
+                matched_tickers = [
+                    str(stock.get("name", "")).upper()
+                    for stock in stocks
+                    if str(stock.get("name", "")).upper() in requested
+                ]
+
+                if not stocks and not matched_tickers and len(requested) == 1:
+                    matched_tickers = [next(iter(requested))]
+
+                channels = item.get("channels") or []
+                channel_names = [str(channel.get("name", "")).strip() for channel in channels if channel.get("name")]
+
+                for ticker in matched_tickers:
+                    rows.append(
+                        {
+                            "timestamp": timestamp,
+                            "ticker": ticker,
+                            "headline": text,
+                            "title": title,
+                            "summary": teaser or body,
+                            "source": "Benzinga",
+                            "url": item.get("url"),
+                            "relevance": 1.0,
+                            "channels": ",".join(channel_names),
+                            "author": item.get("author"),
+                        }
+                    )
+
+            if len(payload) < self.page_size:
+                break
+
+        frame = pd.DataFrame(rows)
+        if frame.empty:
+            return pd.DataFrame(columns=["timestamp", "ticker", "headline", "relevance", "source", "url"])
+
+        frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=False).dt.tz_localize(None)
+        frame["ticker"] = frame["ticker"].astype(str).str.upper()
+        return frame.sort_values(["timestamp", "ticker"]).reset_index(drop=True)
+
+
+class CompositeHeadlineProvider(HeadlineProvider):
+    def __init__(
+        self,
+        providers: Sequence[HeadlineProvider],
+        dedup_config: HeadlineDedupConfig = HeadlineDedupConfig(),
+    ) -> None:
+        if not providers:
+            raise ValueError("CompositeHeadlineProvider requires at least one underlying provider.")
+        self.providers = list(providers)
+        self.dedup_config = dedup_config
+
+    def get_headlines(
+        self,
+        tickers: Sequence[str],
+        start: str | pd.Timestamp,
+        end: str | pd.Timestamp,
+    ) -> pd.DataFrame:
+        frames: list[pd.DataFrame] = []
+        for provider in self.providers:
+            frame = provider.get_headlines(tickers=tickers, start=start, end=end).copy()
+            if frame.empty:
+                continue
+            frame["provider_name"] = provider.__class__.__name__
+            if "source" not in frame.columns:
+                frame["source"] = frame["provider_name"]
+            frame["source"] = frame["source"].fillna(frame["provider_name"]).astype(str)
+            if "relevance" not in frame.columns:
+                frame["relevance"] = 1.0
+            frames.append(frame)
+
+        if not frames:
+            return pd.DataFrame(columns=["timestamp", "ticker", "headline", "relevance", "source", "url"])
+
+        combined = pd.concat(frames, axis=0, ignore_index=True, sort=False)
+        return deduplicate_headlines(combined, config=self.dedup_config)
+
+
+def _read_table(path: Path) -> pd.DataFrame:
+    suffix = path.suffix.lower()
+    if suffix == ".csv":
+        return pd.read_csv(path)
+    if suffix == ".parquet":
+        return pd.read_parquet(path)
+    if suffix == ".json":
+        return pd.read_json(path)
+    raise ValueError(f"Unsupported table format '{path.suffix}' for {path}")
+
+
+class LocalNewsFileProvider(HeadlineProvider):
+    def __init__(
+        self,
+        path: str | Path,
+        timestamp_col: str = "timestamp",
+        ticker_col: str = "ticker",
+        headline_col: str = "headline",
+    ) -> None:
+        self.path = Path(path)
+        self.timestamp_col = timestamp_col
+        self.ticker_col = ticker_col
+        self.headline_col = headline_col
+
+    def get_headlines(
+        self,
+        tickers: Sequence[str],
+        start: str | pd.Timestamp,
+        end: str | pd.Timestamp,
+    ) -> pd.DataFrame:
+        frame = _read_table(self.path).copy()
+        required = {self.timestamp_col, self.ticker_col, self.headline_col}
+        missing = required.difference(frame.columns)
+        if missing:
+            raise ValueError(f"Missing headline columns in {self.path}: {sorted(missing)}")
+
+        frame = frame.rename(
+            columns={
+                self.timestamp_col: "timestamp",
+                self.ticker_col: "ticker",
+                self.headline_col: "headline",
+            }
+        )
+        frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=False).dt.tz_localize(None)
+        frame["ticker"] = frame["ticker"].astype(str).str.upper()
+
+        normalized_tickers = {str(ticker).upper() for ticker in tickers}
+        start_ts = pd.Timestamp(start).normalize()
+        end_ts = pd.Timestamp(end).normalize()
+        mask = (
+            frame["ticker"].isin(normalized_tickers)
+            & (frame["timestamp"] >= start_ts)
+            & (frame["timestamp"] <= end_ts + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1))
+        )
+        filtered = frame.loc[mask].sort_values(["timestamp", "ticker"]).reset_index(drop=True)
+        if "relevance" not in filtered.columns:
+            filtered["relevance"] = 1.0
+        if "source" not in filtered.columns:
+            filtered["source"] = self.path.stem
+        return filtered
+
+
+class DailySentimentFileProvider(DailySentimentProvider):
+    def __init__(self, path: str | Path) -> None:
+        self.path = Path(path)
+
+    def get_daily_sentiment(
+        self,
+        tickers: Sequence[str],
+        start: str | pd.Timestamp,
+        end: str | pd.Timestamp,
+    ) -> pd.DataFrame:
+        frame = _read_table(self.path).copy()
+        required = {
+            "date",
+            "ticker",
+            "sentiment_score",
+            "sentiment_abs",
+            "confidence",
+            "article_count",
+            "positive_prob",
+            "negative_prob",
+            "neutral_prob",
+        }
+        missing = required.difference(frame.columns)
+        if missing:
+            raise ValueError(f"Missing daily sentiment columns in {self.path}: {sorted(missing)}")
+
+        frame["date"] = pd.to_datetime(frame["date"]).dt.tz_localize(None).dt.normalize()
+        frame["ticker"] = frame["ticker"].astype(str).str.upper()
+        normalized_tickers = {str(ticker).upper() for ticker in tickers}
+        start_ts = pd.Timestamp(start).normalize()
+        end_ts = pd.Timestamp(end).normalize()
+        mask = (
+            frame["ticker"].isin(normalized_tickers)
+            & (frame["date"] >= start_ts)
+            & (frame["date"] <= end_ts)
+        )
+        return frame.loc[mask].sort_values(["date", "ticker"]).reset_index(drop=True)
+
+
+class CachedNewsSentimentProvider(DailySentimentProvider):
+    """
+    Fetches raw headlines from a provider, scores them with a sentiment model, and caches the
+    aggregated daily sentiment output to parquet.
+    """
+
+    def __init__(
+        self,
+        headline_provider: HeadlineProvider,
+        sentiment_model: BaseSentimentModel,
+        cache_dir: str | Path = "data/sentiment_cache",
+    ) -> None:
+        self.headline_provider = headline_provider
+        self.sentiment_model = sentiment_model
+        self.aggregator = NewsSentimentAggregator(model=sentiment_model)
+        self.cache_dir = Path(cache_dir)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+
+    def _paths_for(self, request: NewsRequest) -> tuple[Path, Path]:
+        extra = {
+            "headline_provider": self.headline_provider.__class__.__name__,
+            "sentiment_model": self.sentiment_model.__class__.__name__,
+        }
+        key = request.cache_key(extra=extra)
+        parquet_path = self.cache_dir / f"{key}.parquet"
+        meta_path = self.cache_dir / f"{key}.json"
+        return parquet_path, meta_path
+
+    def get_daily_sentiment(
+        self,
+        tickers: Sequence[str],
+        start: str | pd.Timestamp,
+        end: str | pd.Timestamp,
+    ) -> pd.DataFrame:
+        request = NewsRequest.from_inputs(tickers=tickers, start=start, end=end)
+        parquet_path, meta_path = self._paths_for(request)
+
+        if parquet_path.exists():
+            cached = pd.read_parquet(parquet_path)
+            cached["date"] = pd.to_datetime(cached["date"]).dt.tz_localize(None).dt.normalize()
+            cached["ticker"] = cached["ticker"].astype(str).str.upper()
+            return cached.sort_values(["date", "ticker"]).reset_index(drop=True)
+
+        headlines = self.headline_provider.get_headlines(
+            tickers=request.tickers,
+            start=request.start,
+            end=request.end,
+        )
+        daily_sentiment = self.aggregator.build_daily_sentiment(headlines)
+        daily_sentiment.to_parquet(parquet_path)
+
+        metadata = {
+            **asdict(request),
+            "headline_provider": self.headline_provider.__class__.__name__,
+            "sentiment_model": self.sentiment_model.__class__.__name__,
+            "headline_count": int(len(headlines)),
+        }
+        with meta_path.open("w", encoding="utf-8") as handle:
+            json.dump(metadata, handle, indent=2)
+
+        return daily_sentiment

@@ -1,2 +1,7 @@
 *venv
 *.pyc
+__pycache__/
+artifacts/
+data/cache/
+data/hf_cache/
+data/sentiment_cache/

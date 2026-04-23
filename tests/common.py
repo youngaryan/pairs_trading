@@ -1,0 +1,103 @@
+from __future__ import annotations
+
+from pathlib import Path
+import shutil
+
+import numpy as np
+import pandas as pd
+
+
+def synthetic_prices_and_sector_map() -> tuple[pd.DataFrame, dict[str, str]]:
+    rng = np.random.default_rng(7)
+    index = pd.date_range("2020-01-01", periods=900, freq="B")
+
+    base_a = 100 + np.cumsum(rng.normal(0, 0.4, len(index)))
+    base_b = 80 + np.cumsum(rng.normal(0, 0.35, len(index)))
+    base_c = 60 + np.cumsum(rng.normal(0, 0.3, len(index)))
+
+    prices = pd.DataFrame(
+        {
+            "A1": base_a + rng.normal(0, 0.4, len(index)),
+            "A2": 5 + 0.95 * base_a + rng.normal(0, 0.5, len(index)),
+            "A3": 10 + 1.05 * base_a + rng.normal(0, 0.7, len(index)),
+            "B1": base_b + rng.normal(0, 0.3, len(index)),
+            "B2": 3 + 1.02 * base_b + rng.normal(0, 0.45, len(index)),
+            "C1": base_c + rng.normal(0, 1.8, len(index)),
+        },
+        index=index,
+    ).abs() + 5
+
+    sector_map = {
+        "A1": "SectorA",
+        "A2": "SectorA",
+        "A3": "SectorA",
+        "B1": "SectorB",
+        "B2": "SectorB",
+        "C1": "SectorC",
+    }
+    return prices, sector_map
+
+
+def synthetic_daily_sentiment(index: pd.Index) -> pd.DataFrame:
+    dates = pd.DatetimeIndex(index).normalize()
+    rows: list[dict[str, float | str | pd.Timestamp]] = []
+    for i, date in enumerate(dates):
+        phase = np.sin(i / 12.0)
+        rows.extend(
+            [
+                {
+                    "date": date,
+                    "ticker": "A1",
+                    "sentiment_score": float(0.55 + 0.20 * phase),
+                    "sentiment_abs": float(0.55 + 0.20 * abs(phase)),
+                    "confidence": 0.90,
+                    "article_count": 3,
+                    "positive_prob": 0.80,
+                    "negative_prob": 0.05,
+                    "neutral_prob": 0.15,
+                },
+                {
+                    "date": date,
+                    "ticker": "A2",
+                    "sentiment_score": float(-0.35 - 0.10 * phase),
+                    "sentiment_abs": float(0.35 + 0.10 * abs(phase)),
+                    "confidence": 0.88,
+                    "article_count": 3,
+                    "positive_prob": 0.10,
+                    "negative_prob": 0.72,
+                    "neutral_prob": 0.18,
+                },
+                {
+                    "date": date,
+                    "ticker": "B1",
+                    "sentiment_score": float(-0.50 - 0.15 * phase),
+                    "sentiment_abs": float(0.50 + 0.15 * abs(phase)),
+                    "confidence": 0.87,
+                    "article_count": 2,
+                    "positive_prob": 0.08,
+                    "negative_prob": 0.77,
+                    "neutral_prob": 0.15,
+                },
+                {
+                    "date": date,
+                    "ticker": "B2",
+                    "sentiment_score": float(0.45 + 0.12 * phase),
+                    "sentiment_abs": float(0.45 + 0.12 * abs(phase)),
+                    "confidence": 0.86,
+                    "article_count": 2,
+                    "positive_prob": 0.73,
+                    "negative_prob": 0.09,
+                    "neutral_prob": 0.18,
+                },
+            ]
+        )
+
+    return pd.DataFrame(rows)
+
+
+def fresh_test_dir(relative_path: str) -> Path:
+    path = Path(relative_path)
+    if path.exists():
+        shutil.rmtree(path)
+    path.mkdir(parents=True, exist_ok=True)
+    return path
