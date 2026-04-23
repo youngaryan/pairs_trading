@@ -20,6 +20,7 @@ class PortfolioManagerTests(unittest.TestCase):
                     "forecast": [0.8, 0.7, 0.6, 0.2, 0.1],
                     "position": [1.0, 1.0, 1.0, 0.0, 0.0],
                     "cost_estimate": [0.001] * 5,
+                    "unit_return": [0.0, 0.01, -0.005, 0.0, 0.0],
                     "spread_return": [0.0, 0.01, -0.005, 0.0, 0.0],
                     "gross_return": [0.0, 0.01, -0.005, 0.0, 0.0],
                     "short_exposure_per_unit": [0.5] * 5,
@@ -38,6 +39,7 @@ class PortfolioManagerTests(unittest.TestCase):
                     "forecast": [0.9, 0.8, 0.3, 0.2, 0.1],
                     "position": [-1.0, -1.0, 0.0, 0.0, 0.0],
                     "cost_estimate": [0.0015] * 5,
+                    "unit_return": [0.0, 0.015, 0.0, 0.0, 0.0],
                     "spread_return": [0.0, 0.015, 0.0, 0.0, 0.0],
                     "gross_return": [0.0, -0.015, 0.0, 0.0, 0.0],
                     "short_exposure_per_unit": [0.55] * 5,
@@ -52,7 +54,7 @@ class PortfolioManagerTests(unittest.TestCase):
             max_leverage=1.0,
             risk_per_trade=0.05,
             volatility_window=2,
-            max_pair_weight=0.75,
+            max_strategy_weight=0.75,
         )
         portfolio = manager.allocate_capital(
             {"AAA_BBB": pair_one, "CCC_DDD": pair_two},

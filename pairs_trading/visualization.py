@@ -72,7 +72,7 @@ class ExperimentVisualizer:
         plt.grid(alpha=0.25)
         return self._save_current_figure("exposure_costs.png")
 
-    def plot_pair_weights(self, result: ExperimentResult) -> Path | None:
+    def plot_strategy_weights(self, result: ExperimentResult) -> Path | None:
         frame = result.equity_curve.sort_index()
         weight_columns = [column for column in frame.columns if column.startswith("weight_")]
         if not weight_columns:
@@ -88,9 +88,9 @@ class ExperimentVisualizer:
         tick_positions = np.linspace(0, len(frame.index) - 1, num=min(8, len(frame.index)), dtype=int)
         plt.xticks(tick_positions, [frame.index[i].strftime("%Y-%m-%d") for i in tick_positions], rotation=45, ha="right")
         plt.yticks(range(len(weight_columns)), [column.replace("weight_", "") for column in weight_columns])
-        plt.title("Pair Weight Heatmap")
+        plt.title("Strategy Weight Heatmap")
         plt.colorbar(label="Weight")
-        return self._save_current_figure("pair_weights.png")
+        return self._save_current_figure("strategy_weights.png")
 
     def plot_sentiment_overlay(self, result: ExperimentResult) -> Path | None:
         frame = result.equity_curve.sort_index()
@@ -207,7 +207,7 @@ class ExperimentVisualizer:
             generated[name] = path
 
         for name, method in (
-            ("pair_weights", self.plot_pair_weights),
+            ("strategy_weights", self.plot_strategy_weights),
             ("sentiment_overlay", self.plot_sentiment_overlay),
             ("latest_pair_selection", self.plot_latest_pair_selection),
         ):

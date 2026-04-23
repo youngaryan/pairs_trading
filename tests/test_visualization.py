@@ -64,7 +64,7 @@ class VisualizationTests(unittest.TestCase):
             "drawdown",
             "exposure_costs",
             "fold_metrics",
-            "pair_weights",
+            "strategy_weights",
             "sentiment_overlay",
             "latest_pair_selection",
             "report",

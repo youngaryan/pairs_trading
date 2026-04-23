@@ -5,15 +5,16 @@ from typing import Any, Mapping
 
 import pandas as pd
 
-from .portfolio import PortfolioManager
-from .research import PairScreenConfig, rank_sector_pairs
-from .sentiment import (
+from ..framework import StrategyOutput, WalkForwardStrategy
+from ..portfolio import PortfolioManager
+from ..research import PairScreenConfig, rank_sector_pairs
+from ..sentiment import (
     SentimentConfig,
     adjust_pair_rankings_with_sentiment,
     apply_sentiment_overlay,
     build_pair_sentiment_overlay,
 )
-from .strategies import KalmanPairsStrategy, StrategyOutput, WalkForwardStrategy
+from ..strategies import KalmanPairsStrategy
 
 
 @dataclass(frozen=True)
@@ -78,6 +79,7 @@ class SectorStatArbPipeline(WalkForwardStrategy):
         frame["forecast"] = 0.0
         frame["position"] = 0.0
         frame["cost_estimate"] = 0.0
+        frame["unit_return"] = 0.0
         frame["gross_return"] = 0.0
         frame["turnover"] = 0.0
         frame["short_exposure"] = 0.0
@@ -86,7 +88,7 @@ class SectorStatArbPipeline(WalkForwardStrategy):
             name=self.name,
             frame=frame,
             diagnostics={"status": reason, "selected_pairs": []},
-        ).validate(extra_columns=("gross_return",))
+        ).validate(extra_columns=("unit_return", "gross_return"))
 
     def run_fold(self, train_data: pd.DataFrame, test_data: pd.DataFrame) -> StrategyOutput:
         ranked_pairs = rank_sector_pairs(

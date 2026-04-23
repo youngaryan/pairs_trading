@@ -6,9 +6,9 @@ from unittest.mock import patch
 
 import pandas as pd
 
-from pairs_trading.cli import load_daily_sentiment, load_sector_map, run_stat_arb_pipeline
+from pairs_trading.cli import load_daily_sentiment, load_sector_map, run_directional_pipeline, run_stat_arb_pipeline
 from pairs_trading.sentiment import RuleBasedFinancialSentimentModel
-from tests.common import fresh_test_dir, synthetic_prices_and_sector_map
+from tests.common import fresh_test_dir, synthetic_directional_prices, synthetic_prices_and_sector_map
 
 
 class RunPipelineHelperTests(unittest.TestCase):
@@ -112,6 +112,26 @@ class RunPipelineHelperTests(unittest.TestCase):
                 news_provider_names=["local"],
                 news_files=[str(news_path_one), str(news_path_two)],
                 use_finbert=False,
+            )
+
+        self.assertIn("summary", output)
+        self.assertTrue(output["result"].artifact_dir.exists())
+        self.assertIn("report", output["visuals"])
+
+    def test_run_directional_pipeline_with_ma_cross_strategy(self) -> None:
+        prices = synthetic_directional_prices()
+        data_dir = fresh_test_dir("artifacts/test_runner/directional")
+
+        with patch("pairs_trading.cli.CachedParquetProvider.get_close_prices", return_value=prices):
+            output = run_directional_pipeline(
+                strategy_name="ma_cross",
+                symbols=["TREND", "MEAN", "BREAK"],
+                start="2020-01-01",
+                end="2023-12-31",
+                experiment_name="directional_integration",
+                artifact_root=str(data_dir / "experiments"),
+                fast_window=15,
+                slow_window=60,
             )
 
         self.assertIn("summary", output)

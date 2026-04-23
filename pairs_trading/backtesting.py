@@ -9,11 +9,11 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from .framework import StrategyOutput, WalkForwardStrategy
 from .market_data import CachedParquetProvider, YahooFinanceProvider
+from .pipelines import SectorStatArbPipeline, StatArbConfig
 from .portfolio import PortfolioManager
 from .research import PairScreenConfig
-from .stat_arb import SectorStatArbPipeline, StatArbConfig
-from .strategies import StrategyOutput, WalkForwardStrategy
 
 
 @dataclass(frozen=True)
@@ -271,7 +271,7 @@ def main() -> None:
             max_leverage=1.5,
             risk_per_trade=0.08,
             volatility_window=20,
-            max_pair_weight=0.60,
+            max_strategy_weight=0.60,
         ),
         screen_config=PairScreenConfig(
             min_history=252,

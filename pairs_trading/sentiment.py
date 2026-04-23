@@ -11,7 +11,7 @@ from typing import Iterable, Sequence
 import numpy as np
 import pandas as pd
 
-from .strategies import StrategyOutput
+from .framework import StrategyOutput
 
 
 @dataclass(frozen=True)
@@ -550,7 +550,7 @@ def apply_sentiment_overlay(
     config: SentimentConfig,
 ) -> StrategyOutput:
     frame = strategy_output.frame.copy()
-    strategy_output.validate(extra_columns=("spread_return", "gross_return"))
+    strategy_output.validate(extra_columns=("unit_return", "gross_return"))
 
     overlay = sentiment_overlay.reindex(frame.index).fillna(0.0)
     base_position = frame["position"].fillna(0.0)
@@ -569,7 +569,7 @@ def apply_sentiment_overlay(
     overlay_turnover = (adjusted_position - base_position).abs()
     adjusted_forecast = (base_forecast + config.forecast_weight * sentiment_strength).clip(-2.5, 2.5)
     adjusted_signal = np.sign(adjusted_position).replace({-0.0: 0.0})
-    adjusted_gross_return = adjusted_position.shift(1).fillna(0.0) * frame["spread_return"].fillna(0.0)
+    adjusted_gross_return = adjusted_position.shift(1).fillna(0.0) * frame["unit_return"].fillna(0.0)
     adjusted_cost = frame["cost_estimate"].fillna(0.0) + overlay_turnover * (config.overlay_cost_bps / 10_000.0)
 
     frame["signal"] = adjusted_signal
@@ -592,4 +592,4 @@ def apply_sentiment_overlay(
         name=strategy_output.name,
         frame=frame,
         diagnostics=diagnostics,
-    ).validate(extra_columns=("spread_return", "gross_return"))
+    ).validate(extra_columns=("unit_return", "gross_return"))

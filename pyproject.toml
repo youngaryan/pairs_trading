@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "quant-research-app"
+version = "0.1.0"
+description = "Extensible quant research and walk-forward backtesting platform."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "matplotlib>=3.8",
+  "numpy>=1.26",
+  "pandas>=2.2",
+  "pyarrow>=15.0",
+  "statsmodels>=0.14",
+  "yfinance>=0.2",
+]
+
+[project.optional-dependencies]
+sentiment = [
+  "huggingface_hub>=0.22",
+  "torch>=2.2",
+  "transformers>=4.39",
+]
+
+[project.scripts]
+pairs-trading = "pairs_trading.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["pairs_trading*"]

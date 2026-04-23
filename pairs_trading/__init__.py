@@ -1,6 +1,6 @@
 """
-Professional package layout for the pairs trading research stack.
-
-The repository keeps legacy top-level wrappers for backward compatibility, while the
-maintained implementation lives under this package.
+Extensible quant research package with walk-forward backtesting, data caching,
+portfolio construction, sentiment overlays, and multiple strategy families.
 """
+
+__version__ = "0.1.0"

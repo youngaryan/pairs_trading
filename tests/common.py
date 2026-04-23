@@ -95,6 +95,29 @@ def synthetic_daily_sentiment(index: pd.Index) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def synthetic_directional_prices() -> pd.DataFrame:
+    rng = np.random.default_rng(19)
+    index = pd.date_range("2020-01-01", periods=700, freq="B")
+    phase = np.arange(len(index))
+
+    trend = 80 + np.cumsum(rng.normal(0.12, 0.45, len(index)))
+    mean_revert = 100 + 4.0 * np.sin(phase / 6.0) + rng.normal(0.0, 0.7, len(index))
+    breakout_base = 70 + np.cumsum(rng.normal(0.01, 0.25, len(index)))
+    breakout = breakout_base.copy()
+    breakout[380:] += np.cumsum(rng.normal(0.18, 0.35, len(index) - 380))
+    defensive = 90 + np.cumsum(rng.normal(0.03, 0.20, len(index)))
+
+    return pd.DataFrame(
+        {
+            "TREND": pd.Series(trend, index=index).abs() + 10,
+            "MEAN": pd.Series(mean_revert, index=index).abs() + 10,
+            "BREAK": pd.Series(breakout, index=index).abs() + 10,
+            "DEF": pd.Series(defensive, index=index).abs() + 10,
+        },
+        index=index,
+    )
+
+
 def fresh_test_dir(relative_path: str) -> Path:
     path = Path(relative_path)
     if path.exists():

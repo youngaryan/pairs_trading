@@ -146,6 +146,7 @@ class SentimentAggregationTests(unittest.TestCase):
                 "forecast": [0.5, 0.5],
                 "position": [1.0, 1.0],
                 "cost_estimate": [0.001, 0.001],
+                "unit_return": [0.0, 0.02],
                 "spread_return": [0.0, 0.02],
                 "gross_return": [0.0, 0.02],
             },

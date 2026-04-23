@@ -3,10 +3,10 @@ from __future__ import annotations
 import unittest
 
 from pairs_trading.backtesting import CostModel, WalkForwardBacktester, WalkForwardConfig
+from pairs_trading.pipelines import SectorStatArbPipeline, StatArbConfig
 from pairs_trading.portfolio import PortfolioManager
 from pairs_trading.research import PairScreenConfig, rank_sector_pairs
 from pairs_trading.sentiment import SentimentConfig
-from pairs_trading.stat_arb import SectorStatArbPipeline, StatArbConfig
 from tests.common import fresh_test_dir, synthetic_daily_sentiment, synthetic_prices_and_sector_map
 
 
@@ -36,7 +36,7 @@ class WalkForwardSmokeTests(unittest.TestCase):
                 max_leverage=1.2,
                 risk_per_trade=0.02,
                 volatility_window=15,
-                max_pair_weight=0.5,
+                max_strategy_weight=0.5,
             ),
             screen_config=PairScreenConfig(
                 min_history=180,
@@ -92,7 +92,7 @@ class WalkForwardSmokeTests(unittest.TestCase):
                 max_leverage=1.2,
                 risk_per_trade=0.02,
                 volatility_window=15,
-                max_pair_weight=0.5,
+                max_strategy_weight=0.5,
             ),
             "screen_config": PairScreenConfig(
                 min_history=180,
