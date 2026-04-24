@@ -1,19 +1,23 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import numpy as np
 import pandas as pd
 
+from .broker import BrokerAdapter, BrokerConfig, SimulatedBroker
+from .execution import ExecutionConfig
 from .framework import StrategyOutput, WalkForwardStrategy
 from .market_data import CachedParquetProvider, YahooFinanceProvider
 from .pipelines import SectorStatArbPipeline, StatArbConfig
 from .portfolio import PortfolioManager
 from .research import PairScreenConfig
+from .risk import RiskConfig
+from .validation import ValidationConfig, build_validation_report, build_walk_forward_boundaries
 
 
 @dataclass(frozen=True)
@@ -21,11 +25,10 @@ class CostModel:
     commission_bps: float = 1.0
     spread_bps: float = 1.0
     slippage_bps: float = 1.0
+    market_impact_bps: float = 0.5
     borrow_bps_annual: float = 50.0
-
-    @property
-    def transaction_cost_rate(self) -> float:
-        return (self.commission_bps + self.spread_bps + self.slippage_bps) / 10_000.0
+    funding_bps_annual: float = 0.0
+    delay_bars: int = 0
 
 
 @dataclass(frozen=True)
@@ -34,6 +37,8 @@ class WalkForwardConfig:
     test_bars: int
     step_bars: int | None = None
     bars_per_year: int = 252
+    purge_bars: int = 0
+    embargo_bars: int = 0
 
 
 @dataclass
@@ -44,6 +49,7 @@ class ExperimentResult:
     equity_curve: pd.DataFrame
     diagnostics: list[dict[str, Any]]
     artifact_dir: Path
+    validation: dict[str, Any] = field(default_factory=dict)
 
 
 def json_ready(value: Any) -> Any:
@@ -63,6 +69,8 @@ def json_ready(value: Any) -> Any:
         return value.item()
     if isinstance(value, np.ndarray):
         return value.tolist()
+    if isinstance(value, Path):
+        return str(value)
     return value
 
 
@@ -73,47 +81,41 @@ class WalkForwardBacktester:
         prices: pd.DataFrame,
         config: WalkForwardConfig,
         cost_model: CostModel,
+        broker: BrokerAdapter | None = None,
+        validation_config: ValidationConfig = ValidationConfig(),
         experiment_root: str | Path = "artifacts/experiments",
     ) -> None:
         self.strategy = strategy
         self.prices = prices.sort_index()
         self.config = config
         self.cost_model = cost_model
+        self.broker = broker or SimulatedBroker(
+            BrokerConfig(
+                risk=RiskConfig(max_gross_leverage=10.0, max_net_leverage=10.0),
+                execution=ExecutionConfig(
+                    commission_bps=cost_model.commission_bps,
+                    spread_bps=cost_model.spread_bps,
+                    slippage_bps=cost_model.slippage_bps,
+                    market_impact_bps=cost_model.market_impact_bps,
+                    borrow_bps_annual=cost_model.borrow_bps_annual,
+                    funding_bps_annual=cost_model.funding_bps_annual,
+                    delay_bars=cost_model.delay_bars,
+                ),
+            )
+        )
+        self.validation_config = validation_config
         self.experiment_root = Path(experiment_root)
         self.experiment_root.mkdir(parents=True, exist_ok=True)
 
-    def _fold_boundaries(self) -> list[tuple[int, int, int]]:
-        boundaries: list[tuple[int, int, int]] = []
-        step = self.config.step_bars or self.config.test_bars
-        test_start = self.config.train_bars
-
-        while test_start + self.config.test_bars <= len(self.prices):
-            train_start = test_start - self.config.train_bars
-            test_end = test_start + self.config.test_bars
-            boundaries.append((train_start, test_start, test_end))
-            test_start += step
-
-        return boundaries
-
-    def _apply_cost_model(self, output: StrategyOutput) -> pd.DataFrame:
-        frame = output.frame.copy()
-        output.validate(extra_columns=("gross_return",))
-
-        if "turnover" not in frame.columns:
-            frame["turnover"] = frame["position"].diff().abs().fillna(frame["position"].abs())
-        frame["turnover"] = frame["turnover"].fillna(0.0)
-
-        frame["execution_cost"] = frame["turnover"] * self.cost_model.transaction_cost_rate
-
-        short_exposure = frame.get("short_exposure", frame["position"].shift(1).abs().fillna(0.0) * 0.5)
-        frame["borrow_cost"] = short_exposure.fillna(0.0) * (
-            self.cost_model.borrow_bps_annual / 10_000.0 / self.config.bars_per_year
+    def _fold_boundaries(self):
+        return build_walk_forward_boundaries(
+            total_bars=len(self.prices),
+            train_bars=self.config.train_bars,
+            test_bars=self.config.test_bars,
+            step_bars=self.config.step_bars,
+            purge_bars=self.config.purge_bars,
+            embargo_bars=self.config.embargo_bars,
         )
-        frame["strategy_cost"] = frame["cost_estimate"].fillna(0.0)
-        frame["total_cost"] = frame["execution_cost"] + frame["borrow_cost"] + frame["strategy_cost"]
-        frame["net_return"] = frame["gross_return"].fillna(0.0) - frame["total_cost"]
-        frame["equity_curve"] = (1.0 + frame["net_return"]).cumprod()
-        return frame
 
     def _compute_metrics(self, frame: pd.DataFrame) -> dict[str, float]:
         if frame.empty:
@@ -161,6 +163,7 @@ class WalkForwardBacktester:
         fold_metrics: pd.DataFrame,
         equity_curve: pd.DataFrame,
         diagnostics: list[dict[str, Any]],
+        validation: dict[str, Any],
     ) -> Path:
         artifact_dir = self.experiment_root / experiment_id
         artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -169,12 +172,18 @@ class WalkForwardBacktester:
             json.dump(json_ready(summary), handle, indent=2)
         with (artifact_dir / "diagnostics.json").open("w", encoding="utf-8") as handle:
             json.dump(json_ready(diagnostics), handle, indent=2)
+        with (artifact_dir / "validation.json").open("w", encoding="utf-8") as handle:
+            json.dump(json_ready(validation), handle, indent=2)
 
         fold_metrics.to_parquet(artifact_dir / "fold_metrics.parquet")
         equity_curve.to_parquet(artifact_dir / "equity_curve.parquet")
         return artifact_dir
 
-    def run(self, experiment_name: str | None = None) -> ExperimentResult:
+    def run(
+        self,
+        experiment_name: str | None = None,
+        validation_trial_returns: pd.DataFrame | None = None,
+    ) -> ExperimentResult:
         fold_boundaries = self._fold_boundaries()
         if not fold_boundaries:
             raise ValueError("Not enough data to generate any walk-forward folds.")
@@ -187,19 +196,20 @@ class WalkForwardBacktester:
         fold_metrics: list[dict[str, Any]] = []
         diagnostics: list[dict[str, Any]] = []
 
-        for fold_number, (train_start, test_start, test_end) in enumerate(fold_boundaries, start=1):
-            train_data = self.prices.iloc[train_start:test_start].copy()
-            test_data = self.prices.iloc[test_start:test_end].copy()
+        for boundary in fold_boundaries:
+            train_data = self.prices.iloc[boundary.train_start : boundary.train_end].copy()
+            test_data = self.prices.iloc[boundary.test_start : boundary.test_end].copy()
 
             output = self.strategy.run_fold(train_data=train_data, test_data=test_data)
-            evaluated = self._apply_cost_model(output)
-            evaluated["fold"] = fold_number
+            evaluated_output = self.broker.process(output, bars_per_year=self.config.bars_per_year)
+            evaluated = evaluated_output.frame.copy()
+            evaluated["fold"] = boundary.fold
             fold_frames.append(evaluated)
 
             metrics = self._compute_metrics(evaluated)
             metrics.update(
                 {
-                    "fold": fold_number,
+                    "fold": boundary.fold,
                     "train_start": train_data.index[0],
                     "train_end": train_data.index[-1],
                     "test_start": test_data.index[0],
@@ -207,10 +217,16 @@ class WalkForwardBacktester:
                 }
             )
             fold_metrics.append(metrics)
-            diagnostics.append({"fold": fold_number, "diagnostics": output.diagnostics})
+            diagnostics.append({"fold": boundary.fold, "diagnostics": evaluated_output.diagnostics})
 
         combined = pd.concat(fold_frames, axis=0)
         overall_summary = self._compute_metrics(combined)
+        validation_summary = build_validation_report(
+            returns=combined["net_return"],
+            bars_per_year=self.config.bars_per_year,
+            trial_returns=validation_trial_returns,
+            pbo_partitions=self.validation_config.pbo_partitions,
+        )
         overall_summary.update(
             {
                 "experiment_id": experiment_id,
@@ -218,6 +234,9 @@ class WalkForwardBacktester:
                 "strategy": experiment_label,
                 "cost_model": asdict(self.cost_model),
                 "walk_forward_config": asdict(self.config),
+                "psr": validation_summary["psr"],
+                "dsr": validation_summary["dsr"],
+                "pbo": validation_summary["pbo"],
             }
         )
 
@@ -228,6 +247,7 @@ class WalkForwardBacktester:
             fold_metrics=fold_metrics_frame,
             equity_curve=combined,
             diagnostics=diagnostics,
+            validation=validation_summary,
         )
 
         return ExperimentResult(
@@ -236,8 +256,38 @@ class WalkForwardBacktester:
             fold_metrics=fold_metrics_frame,
             equity_curve=combined,
             diagnostics=diagnostics,
+            validation=validation_summary,
             artifact_dir=artifact_dir,
         )
+
+
+def run_trial_grid(
+    *,
+    prices: pd.DataFrame,
+    strategy_factories: Mapping[str, WalkForwardStrategy],
+    config: WalkForwardConfig,
+    cost_model: CostModel,
+    broker: BrokerAdapter | None = None,
+    experiment_root: str | Path = "artifacts/experiments/trials",
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    trial_returns: dict[str, pd.Series] = {}
+    trial_metrics: list[dict[str, Any]] = []
+
+    for trial_name, strategy in strategy_factories.items():
+        result = WalkForwardBacktester(
+            strategy=strategy,
+            prices=prices,
+            config=config,
+            cost_model=cost_model,
+            broker=broker,
+            experiment_root=Path(experiment_root),
+        ).run(experiment_name=trial_name)
+        trial_returns[trial_name] = result.equity_curve["net_return"].rename(trial_name)
+        metrics = dict(result.summary)
+        metrics["trial_name"] = trial_name
+        trial_metrics.append(metrics)
+
+    return pd.DataFrame(trial_returns).sort_index(), pd.DataFrame(trial_metrics)
 
 
 def main() -> None:

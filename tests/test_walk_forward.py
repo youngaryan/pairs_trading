@@ -137,8 +137,8 @@ class WalkForwardSmokeTests(unittest.TestCase):
 
         self.assertTrue(sentiment_output.diagnostics["sentiment_enabled"])
         self.assertFalse(baseline_output.frame.equals(sentiment_output.frame))
-        self.assertIn("weight_A1_A2", sentiment_output.frame.columns)
-        self.assertIn("weight_B1_B2", sentiment_output.frame.columns)
+        self.assertIn("weight_pair_A1_A2", sentiment_output.frame.columns)
+        self.assertIn("weight_pair_B1_B2", sentiment_output.frame.columns)
         self.assertGreater(
             float((baseline_output.frame["position"] - sentiment_output.frame["position"]).abs().sum()),
             0.0,

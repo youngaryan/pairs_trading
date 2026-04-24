@@ -4,13 +4,26 @@ This repository is structured as an early-stage professional quant research app 
 
 The architecture follows a modular flow:
 - `pairs_trading/framework.py`: shared strategy interfaces and standardized outputs
-- `pairs_trading/strategies/`: reusable alpha models
+- `pairs_trading/strategies/`: reusable alpha models for directional, stat-arb, and event-driven sleeves
 - `pairs_trading/pipelines/`: orchestration layers that turn strategy outputs into portfolios
 - `pairs_trading/portfolio.py`: portfolio construction and leverage control
-- `pairs_trading/backtesting.py`: walk-forward backtests, costs, metrics, and artifact persistence
-- `pairs_trading/market_data.py` and `pairs_trading/news_data.py`: provider interfaces plus parquet caching
+- `pairs_trading/backtesting.py`: walk-forward backtests, purged validation, trial grids, and artifact persistence
+- `pairs_trading/risk.py`, `pairs_trading/execution.py`, `pairs_trading/broker.py`, `pairs_trading/reconciliation.py`: pre-trade risk, execution assumptions, broker simulation, and post-trade reconciliation
+- `pairs_trading/market_data.py`, `pairs_trading/news_data.py`, and `pairs_trading/events_data.py`: provider interfaces plus parquet caching
 - `pairs_trading/sentiment.py`: finance-specific sentiment scoring and overlays
 - `pairs_trading/visualization.py`: charts and HTML reports
+
+## Main Sleeves
+
+The current codebase supports three research sleeves that can be matured independently:
+- `etf_trend`: medium-frequency ETF trend and momentum with inverse-volatility sizing and rotation
+- `stat_arb`: sector-neutral residual mean reversion plus classic pairs as a sub-sleeve
+- `edgar_event`: EDGAR-style event drift using standardized event inputs or SEC company facts
+
+The repo also keeps generic indicator pipelines for single-asset research:
+- `ma_cross`
+- `rsi_mean_reversion`
+- `donchian_breakout`
 
 ## Run From Source
 
@@ -20,12 +33,28 @@ General help:
 .\.venv\Scripts\python.exe -m pairs_trading --help
 ```
 
-Stat-arb pipeline:
+Step-by-step backtest examples live in [docs/backtest_workflows.md](docs/backtest_workflows.md).
+
+### ETF Trend / Momentum
+
+```powershell
+.\.venv\Scripts\python.exe -m pairs_trading `
+  --pipeline etf_trend `
+  --symbols SPY QQQ IWM DIA TLT IEF GLD XLE XLF XLK XLV `
+  --experiment-name etf_trend_core `
+  --validation-purge-bars 5 `
+  --validation-pbo-partitions 8
+```
+
+### Sector-Neutral Residual Stat-Arb
 
 ```powershell
 .\.venv\Scripts\python.exe -m pairs_trading `
   --pipeline stat_arb `
-  --experiment-name sector_stat_arb
+  --sector-map examples\sector_map.sample.json `
+  --experiment-name residual_stat_arb `
+  --validation-purge-bars 5 `
+  --validation-pbo-partitions 8
 ```
 
 Stat-arb with local news sentiment:
@@ -33,13 +62,39 @@ Stat-arb with local news sentiment:
 ```powershell
 .\.venv\Scripts\python.exe -m pairs_trading `
   --pipeline stat_arb `
+  --sector-map examples\sector_map.sample.json `
   --news-provider local `
   --news-file data\news\headlines.csv `
   --use-finbert `
   --experiment-name stat_arb_finbert
 ```
 
-Moving-average crossover research:
+### EDGAR Event Drift
+
+Using a local standardized event file:
+
+```powershell
+.\.venv\Scripts\python.exe -m pairs_trading `
+  --pipeline edgar_event `
+  --symbols AAPL MSFT NVDA AMZN GOOGL META JPM XOM `
+  --event-file examples\events.sample.csv `
+  --experiment-name edgar_event_local
+```
+
+Using SEC company facts directly:
+
+```powershell
+.\.venv\Scripts\python.exe -m pairs_trading `
+  --pipeline edgar_event `
+  --symbols AAPL MSFT NVDA AMZN `
+  --use-sec-companyfacts `
+  --edgar-user-agent "Your Name your.email@example.com" `
+  --experiment-name edgar_event_sec
+```
+
+### Generic Indicator Research
+
+Moving-average crossover:
 
 ```powershell
 .\.venv\Scripts\python.exe -m pairs_trading `
@@ -50,7 +105,7 @@ Moving-average crossover research:
   --experiment-name ma_cross_equities
 ```
 
-RSI mean-reversion research:
+RSI mean reversion:
 
 ```powershell
 .\.venv\Scripts\python.exe -m pairs_trading `
@@ -63,7 +118,7 @@ RSI mean-reversion research:
   --experiment-name rsi_reversion
 ```
 
-Donchian breakout research:
+Donchian breakout:
 
 ```powershell
 .\.venv\Scripts\python.exe -m pairs_trading `
@@ -77,16 +132,25 @@ Donchian breakout research:
 The root launcher still works too:
 
 ```powershell
-.\.venv\Scripts\python.exe run_pipeline.py --pipeline ma_cross --symbols AAPL MSFT NVDA
+.\.venv\Scripts\python.exe run_pipeline.py --pipeline etf_trend
 ```
 
 ## Output
 
 Each run writes an experiment folder under `artifacts/experiments/<timestamp>_<name>/` with:
 - `summary.json`
+- `validation.json`
 - `diagnostics.json`
-- parquet outputs for folds and equity
+- `fold_metrics.parquet`
+- `equity_curve.parquet`
+- `validation_trial_metrics.parquet` when a trial grid is used
 - a `visuals/` folder with charts and an HTML report
+
+Key metrics:
+- `psr`: probabilistic Sharpe ratio
+- `dsr`: deflated Sharpe ratio
+- `pbo`: probability of backtest overfitting
+- `avg_turnover`, `max_drawdown`, `annualized_return`, `annualized_vol`
 
 ## Tests
 
@@ -99,5 +163,5 @@ Each run writes an experiment folder under `artifacts/experiments/<timestamp>_<n
 This repo includes a `pyproject.toml` so it can grow into an installable internal research package. Once installed in editable mode, you can also run:
 
 ```powershell
-pairs-trading --pipeline ma_cross --symbols AAPL MSFT NVDA
+pairs-trading --pipeline etf_trend
 ```

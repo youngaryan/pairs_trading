@@ -14,11 +14,17 @@ from ..sentiment import (
     apply_sentiment_overlay,
     build_pair_sentiment_overlay,
 )
-from ..strategies import KalmanPairsStrategy
+from ..strategies import KalmanPairsStrategy, SectorResidualMeanReversionStrategy
 
 
 @dataclass(frozen=True)
 class StatArbConfig:
+    include_residual_book: bool = True
+    residual_lookback: int = 60
+    residual_entry_z: float = 1.5
+    residual_exit_z: float = 0.35
+    residual_transaction_cost_bps: float = 2.0
+    include_classic_pairs: bool = True
     top_n_pairs: int = 3
     entry_z: float = 2.0
     exit_z: float = 0.35
@@ -91,60 +97,88 @@ class SectorStatArbPipeline(WalkForwardStrategy):
         ).validate(extra_columns=("unit_return", "gross_return"))
 
     def run_fold(self, train_data: pd.DataFrame, test_data: pd.DataFrame) -> StrategyOutput:
-        ranked_pairs = rank_sector_pairs(
-            prices=train_data,
-            sector_map=self.sector_map,
-            screen_config=self.screen_config,
-        )
-        if self.daily_sentiment is not None and self.sentiment_config is not None and not ranked_pairs.empty:
-            ranked_pairs = adjust_pair_rankings_with_sentiment(
-                ranked_pairs=ranked_pairs,
-                daily_sentiment=self.daily_sentiment,
-                asof_date=train_data.index[-1],
-                config=self.sentiment_config,
-            )
-        if ranked_pairs.empty:
-            return self._flat_output(index=test_data.index, reason="no_ranked_pairs")
-
-        selected_pairs = select_diversified_pairs(
-            ranked_pairs=ranked_pairs,
-            top_n_pairs=self.stat_arb_config.top_n_pairs,
-        )
-        if not selected_pairs:
-            return self._flat_output(index=test_data.index, reason="no_selected_pairs")
-
         pair_outputs: dict[str, StrategyOutput] = {}
-        for pair_record in selected_pairs:
-            ticker1 = pair_record["Ticker_1"]
-            ticker2 = pair_record["Ticker_2"]
-            strategy = KalmanPairsStrategy(
-                ticker1=ticker1,
-                ticker2=ticker2,
-                entry_z=self.stat_arb_config.entry_z,
-                exit_z=self.stat_arb_config.exit_z,
-                break_window=self.stat_arb_config.break_window,
-                break_pvalue=self.stat_arb_config.break_pvalue,
-                transaction_cost_bps=self.stat_arb_config.transaction_cost_bps,
-                pair_metadata=pair_record,
+
+        residual_symbols: list[str] = []
+        if self.stat_arb_config.include_residual_book:
+            sector_buckets: dict[str, list[str]] = {}
+            for ticker, sector in self.sector_map.items():
+                if ticker in train_data.columns and ticker in test_data.columns:
+                    sector_buckets.setdefault(sector, []).append(ticker)
+
+            for sector, sector_symbols in sector_buckets.items():
+                if len(sector_symbols) < 2:
+                    continue
+                for symbol in sorted(sector_symbols):
+                    strategy = SectorResidualMeanReversionStrategy(
+                        symbol=symbol,
+                        sector_symbols=sector_symbols,
+                        lookback=self.stat_arb_config.residual_lookback,
+                        entry_z=self.stat_arb_config.residual_entry_z,
+                        exit_z=self.stat_arb_config.residual_exit_z,
+                        transaction_cost_bps=self.stat_arb_config.residual_transaction_cost_bps,
+                    )
+                    output = strategy.run_fold(
+                        train_data=train_data[sector_symbols],
+                        test_data=test_data[sector_symbols],
+                    )
+                    pair_outputs[f"residual_{symbol}"] = output
+                    residual_symbols.append(symbol)
+
+        ranked_pairs = pd.DataFrame()
+        selected_pairs: list[dict[str, Any]] = []
+        if self.stat_arb_config.include_classic_pairs:
+            ranked_pairs = rank_sector_pairs(
+                prices=train_data,
+                sector_map=self.sector_map,
+                screen_config=self.screen_config,
             )
-            pair_name = f"{ticker1}_{ticker2}"
-            pair_outputs[pair_name] = strategy.run_fold(
-                train_data=train_data[[ticker1, ticker2]],
-                test_data=test_data[[ticker1, ticker2]],
-            )
-            if self.daily_sentiment is not None and self.sentiment_config is not None:
-                overlay = build_pair_sentiment_overlay(
+            if self.daily_sentiment is not None and self.sentiment_config is not None and not ranked_pairs.empty:
+                ranked_pairs = adjust_pair_rankings_with_sentiment(
+                    ranked_pairs=ranked_pairs,
                     daily_sentiment=self.daily_sentiment,
+                    asof_date=train_data.index[-1],
+                    config=self.sentiment_config,
+                )
+            selected_pairs = select_diversified_pairs(
+                ranked_pairs=ranked_pairs,
+                top_n_pairs=self.stat_arb_config.top_n_pairs,
+            )
+
+            for pair_record in selected_pairs:
+                ticker1 = pair_record["Ticker_1"]
+                ticker2 = pair_record["Ticker_2"]
+                strategy = KalmanPairsStrategy(
                     ticker1=ticker1,
                     ticker2=ticker2,
-                    index=test_data.index,
-                    config=self.sentiment_config,
+                    entry_z=self.stat_arb_config.entry_z,
+                    exit_z=self.stat_arb_config.exit_z,
+                    break_window=self.stat_arb_config.break_window,
+                    break_pvalue=self.stat_arb_config.break_pvalue,
+                    transaction_cost_bps=self.stat_arb_config.transaction_cost_bps,
+                    pair_metadata=pair_record,
                 )
-                pair_outputs[pair_name] = apply_sentiment_overlay(
-                    strategy_output=pair_outputs[pair_name],
-                    sentiment_overlay=overlay,
-                    config=self.sentiment_config,
+                pair_name = f"pair_{ticker1}_{ticker2}"
+                pair_outputs[pair_name] = strategy.run_fold(
+                    train_data=train_data[[ticker1, ticker2]],
+                    test_data=test_data[[ticker1, ticker2]],
                 )
+                if self.daily_sentiment is not None and self.sentiment_config is not None:
+                    overlay = build_pair_sentiment_overlay(
+                        daily_sentiment=self.daily_sentiment,
+                        ticker1=ticker1,
+                        ticker2=ticker2,
+                        index=test_data.index,
+                        config=self.sentiment_config,
+                    )
+                    pair_outputs[pair_name] = apply_sentiment_overlay(
+                        strategy_output=pair_outputs[pair_name],
+                        sentiment_overlay=overlay,
+                        config=self.sentiment_config,
+                    )
+
+        if not pair_outputs:
+            return self._flat_output(index=test_data.index, reason="no_tradeable_stat_arb_components")
 
         portfolio_output = self.portfolio_manager.allocate_capital(
             strategy_outputs=pair_outputs,
@@ -152,6 +186,11 @@ class SectorStatArbPipeline(WalkForwardStrategy):
         )
         portfolio_output.diagnostics.update(
             {
+                "sub_sleeves": {
+                    "residual_book": self.stat_arb_config.include_residual_book,
+                    "classic_pairs": self.stat_arb_config.include_classic_pairs,
+                },
+                "residual_symbols": residual_symbols,
                 "selected_pairs": selected_pairs,
                 "candidate_count": int(len(ranked_pairs)),
                 "screen_config": self.screen_config.__dict__,

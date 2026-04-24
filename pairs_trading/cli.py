@@ -4,9 +4,21 @@ import argparse
 import json
 import os
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
-from .backtesting import CostModel, ExperimentResult, WalkForwardBacktester, WalkForwardConfig, json_ready
+import pandas as pd
+
+from .backtesting import (
+    CostModel,
+    ExperimentResult,
+    WalkForwardBacktester,
+    WalkForwardConfig,
+    json_ready,
+    run_trial_grid,
+)
+from .broker import BrokerConfig, SimulatedBroker
+from .events_data import CachedEventProvider, LocalEventFileProvider, SecCompanyFactsEventProvider
+from .execution import ExecutionConfig
 from .market_data import CachedParquetProvider, YahooFinanceProvider
 from .news_data import (
     AlphaVantageNewsProvider,
@@ -16,11 +28,22 @@ from .news_data import (
     DailySentimentFileProvider,
     LocalNewsFileProvider,
 )
-from .pipelines import DirectionalPipelineConfig, DirectionalStrategyPipeline, SectorStatArbPipeline, StatArbConfig
+from .pipelines import (
+    DirectionalPipelineConfig,
+    DirectionalStrategyPipeline,
+    ETFMomentumConfig,
+    ETFTrendMomentumPipeline,
+    EventDrivenConfig,
+    EventDrivenPipeline,
+    SectorStatArbPipeline,
+    StatArbConfig,
+)
 from .portfolio import PortfolioManager
 from .research import PairScreenConfig
+from .risk import RiskConfig
 from .sentiment import FinBERTSentimentModel, SentimentConfig, build_best_available_sentiment_model
 from .strategies import DonchianBreakoutStrategy, MovingAverageCrossStrategy, RSIMeanReversionStrategy
+from .validation import ValidationConfig
 from .visualization import ExperimentVisualizer
 
 
@@ -37,6 +60,32 @@ DEFAULT_SECTOR_MAP = {
     "C": "Banks",
 }
 
+DEFAULT_ETF_UNIVERSE = [
+    "SPY",
+    "QQQ",
+    "IWM",
+    "DIA",
+    "TLT",
+    "IEF",
+    "GLD",
+    "SLV",
+    "XLE",
+    "XLF",
+    "XLK",
+    "XLV",
+]
+
+DEFAULT_EVENT_SYMBOLS = [
+    "AAPL",
+    "MSFT",
+    "NVDA",
+    "AMZN",
+    "GOOGL",
+    "META",
+    "JPM",
+    "XOM",
+]
+
 
 def load_sector_map(path: str | Path | None) -> dict[str, str]:
     if path is None:
@@ -48,8 +97,6 @@ def load_sector_map(path: str | Path | None) -> dict[str, str]:
         return {str(ticker).upper(): str(sector) for ticker, sector in data.items()}
 
     if source.suffix.lower() == ".csv":
-        import pandas as pd
-
         frame = pd.read_csv(source)
         if not {"ticker", "sector"} <= set(frame.columns):
             raise ValueError("Sector CSV must contain 'ticker' and 'sector' columns.")
@@ -116,6 +163,36 @@ def load_daily_sentiment(
     return provider.get_daily_sentiment(tickers=tickers, start=start, end=end)
 
 
+def load_events(
+    tickers: list[str],
+    start: str,
+    end: str,
+    *,
+    event_file: str | None,
+    event_cache_dir: str,
+    edgar_user_agent: str | None,
+    use_sec_companyfacts: bool,
+) -> pd.DataFrame | None:
+    if event_file:
+        provider = LocalEventFileProvider(event_file)
+        return provider.get_events(tickers=tickers, start=start, end=end)
+
+    if not use_sec_companyfacts:
+        return None
+
+    if not edgar_user_agent:
+        raise ValueError("SEC EDGAR event loading requires --edgar-user-agent when --use-sec-companyfacts is set.")
+
+    provider = CachedEventProvider(
+        upstream=SecCompanyFactsEventProvider(
+            user_agent=edgar_user_agent,
+            cache_dir=Path(event_cache_dir) / "sec",
+        ),
+        cache_dir=event_cache_dir,
+    )
+    return provider.get_events(tickers=tickers, start=start, end=end)
+
+
 def _build_directional_strategy_factory(
     strategy_name: str,
     *,
@@ -164,6 +241,200 @@ def _build_directional_strategy_factory(
     raise ValueError(f"Unsupported directional strategy: {strategy_name}")
 
 
+def _build_broker(
+    *,
+    max_gross_leverage: float,
+    max_net_leverage: float,
+    max_turnover: float | None,
+    cost_model: CostModel,
+) -> SimulatedBroker:
+    return SimulatedBroker(
+        BrokerConfig(
+            risk=RiskConfig(
+                max_gross_leverage=max_gross_leverage,
+                max_net_leverage=max_net_leverage,
+                max_turnover=max_turnover,
+            ),
+            execution=ExecutionConfig(
+                commission_bps=cost_model.commission_bps,
+                spread_bps=cost_model.spread_bps,
+                slippage_bps=cost_model.slippage_bps,
+                market_impact_bps=cost_model.market_impact_bps,
+                borrow_bps_annual=cost_model.borrow_bps_annual,
+                funding_bps_annual=cost_model.funding_bps_annual,
+                delay_bars=cost_model.delay_bars,
+            ),
+        )
+    )
+
+
+def _run_pipeline_with_validation(
+    *,
+    pipeline,
+    prices: pd.DataFrame,
+    config: WalkForwardConfig,
+    cost_model: CostModel,
+    broker: SimulatedBroker,
+    experiment_name: str,
+    artifact_root: str,
+    trial_strategies: Mapping[str, object] | None = None,
+    validation_config: ValidationConfig = ValidationConfig(),
+) -> dict[str, Any]:
+    trial_returns = None
+    trial_metrics = pd.DataFrame()
+    if trial_strategies:
+        trial_returns, trial_metrics = run_trial_grid(
+            prices=prices,
+            strategy_factories=trial_strategies,
+            config=config,
+            cost_model=cost_model,
+            broker=broker,
+            experiment_root=Path(artifact_root) / "trial_grid" / experiment_name,
+        )
+
+    result = WalkForwardBacktester(
+        strategy=pipeline,
+        prices=prices,
+        config=config,
+        cost_model=cost_model,
+        broker=broker,
+        validation_config=validation_config,
+        experiment_root=artifact_root,
+    ).run(
+        experiment_name=experiment_name,
+        validation_trial_returns=trial_returns,
+    )
+
+    if not trial_metrics.empty:
+        trial_metrics.to_parquet(result.artifact_dir / "validation_trial_metrics.parquet")
+        result.summary["validation_trial_count"] = int(len(trial_metrics))
+        result.validation["validation_trial_count"] = int(len(trial_metrics))
+        (result.artifact_dir / "validation_trial_metrics.json").write_text(
+            json.dumps(json_ready(trial_metrics), indent=2),
+            encoding="utf-8",
+        )
+        (result.artifact_dir / "summary.json").write_text(
+            json.dumps(json_ready(result.summary), indent=2),
+            encoding="utf-8",
+        )
+        (result.artifact_dir / "validation.json").write_text(
+            json.dumps(json_ready(result.validation), indent=2),
+            encoding="utf-8",
+        )
+
+    visuals = ExperimentVisualizer(result.artifact_dir / "visuals").create_dashboard(result)
+    return {
+        "result": result,
+        "visuals": visuals,
+        "summary": json_ready(result.summary),
+        "validation": json_ready(result.validation),
+        "trial_metrics": trial_metrics,
+    }
+
+
+def _build_stat_arb_trial_grid(
+    *,
+    sector_map: Mapping[str, str],
+    daily_sentiment: pd.DataFrame | None,
+    experiment_name: str,
+) -> dict[str, SectorStatArbPipeline]:
+    common_kwargs = {
+        "sector_map": sector_map,
+        "portfolio_manager": PortfolioManager(
+            max_leverage=1.5,
+            risk_per_trade=0.08,
+            volatility_window=20,
+            max_strategy_weight=0.40,
+        ),
+        "screen_config": PairScreenConfig(
+            min_history=252,
+            correlation_floor=0.60,
+            coint_pvalue_threshold=0.10,
+            min_half_life=2.0,
+            max_half_life=60.0,
+            target_half_life=15.0,
+        ),
+        "daily_sentiment": daily_sentiment,
+        "sentiment_config": SentimentConfig() if daily_sentiment is not None else None,
+    }
+    return {
+        f"{experiment_name}_trial_base": SectorStatArbPipeline(
+            stat_arb_config=StatArbConfig(),
+            name=f"{experiment_name}_trial_base",
+            **common_kwargs,
+        ),
+        f"{experiment_name}_trial_faster_residuals": SectorStatArbPipeline(
+            stat_arb_config=StatArbConfig(
+                residual_lookback=40,
+                residual_entry_z=1.35,
+                entry_z=1.85,
+            ),
+            name=f"{experiment_name}_trial_faster_residuals",
+            **common_kwargs,
+        ),
+        f"{experiment_name}_trial_wider_entries": SectorStatArbPipeline(
+            stat_arb_config=StatArbConfig(
+                residual_lookback=80,
+                residual_entry_z=1.75,
+                entry_z=2.25,
+            ),
+            name=f"{experiment_name}_trial_wider_entries",
+            **common_kwargs,
+        ),
+    }
+
+
+def _build_etf_trial_grid(symbols: list[str], experiment_name: str) -> dict[str, ETFTrendMomentumPipeline]:
+    return {
+        f"{experiment_name}_trial_top2": ETFTrendMomentumPipeline(
+            ETFMomentumConfig.from_symbols(symbols, top_n=2, trend_window=180),
+            name=f"{experiment_name}_trial_top2",
+        ),
+        f"{experiment_name}_trial_top3": ETFTrendMomentumPipeline(
+            ETFMomentumConfig.from_symbols(symbols, top_n=3, trend_window=200),
+            name=f"{experiment_name}_trial_top3",
+        ),
+        f"{experiment_name}_trial_top4": ETFTrendMomentumPipeline(
+            ETFMomentumConfig.from_symbols(symbols, top_n=4, trend_window=220),
+            name=f"{experiment_name}_trial_top4",
+        ),
+    }
+
+
+def _build_event_trial_grid(
+    *,
+    symbols: list[str],
+    events: pd.DataFrame,
+    experiment_name: str,
+) -> dict[str, EventDrivenPipeline]:
+    base_kwargs = {
+        "events": events,
+        "portfolio_manager": PortfolioManager(
+            max_leverage=1.25,
+            risk_per_trade=0.05,
+            volatility_window=15,
+            max_strategy_weight=0.25,
+        ),
+    }
+    return {
+        f"{experiment_name}_trial_fast": EventDrivenPipeline(
+            config=EventDrivenConfig.from_symbols(symbols, holding_period_bars=3, entry_threshold=0.10),
+            name=f"{experiment_name}_trial_fast",
+            **base_kwargs,
+        ),
+        f"{experiment_name}_trial_base": EventDrivenPipeline(
+            config=EventDrivenConfig.from_symbols(symbols, holding_period_bars=5, entry_threshold=0.15),
+            name=f"{experiment_name}_trial_base",
+            **base_kwargs,
+        ),
+        f"{experiment_name}_trial_slow": EventDrivenPipeline(
+            config=EventDrivenConfig.from_symbols(symbols, holding_period_bars=10, entry_threshold=0.20),
+            name=f"{experiment_name}_trial_slow",
+            **base_kwargs,
+        ),
+    }
+
+
 def run_stat_arb_pipeline(
     sector_map_path: str | None = None,
     start: str = "2018-01-01",
@@ -182,6 +453,9 @@ def run_stat_arb_pipeline(
     alphavantage_api_key: str | None = None,
     benzinga_api_key: str | None = None,
     news_topics: list[str] | None = None,
+    purge_bars: int = 5,
+    embargo_bars: int = 0,
+    pbo_partitions: int = 8,
 ) -> dict[str, Any]:
     sector_map = load_sector_map(sector_map_path)
     tickers = list(sector_map.keys())
@@ -219,7 +493,7 @@ def run_stat_arb_pipeline(
             max_leverage=1.5,
             risk_per_trade=0.08,
             volatility_window=20,
-            max_strategy_weight=0.60,
+            max_strategy_weight=0.40,
         ),
         screen_config=PairScreenConfig(
             min_history=252,
@@ -230,6 +504,8 @@ def run_stat_arb_pipeline(
             target_half_life=15.0,
         ),
         stat_arb_config=StatArbConfig(
+            include_residual_book=True,
+            include_classic_pairs=True,
             top_n_pairs=3,
             entry_z=2.0,
             exit_z=0.35,
@@ -242,31 +518,49 @@ def run_stat_arb_pipeline(
         name=experiment_name,
     )
 
-    backtester = WalkForwardBacktester(
-        strategy=pipeline,
-        prices=prices,
-        config=WalkForwardConfig(
-            train_bars=504,
-            test_bars=63,
-            step_bars=63,
-            bars_per_year=252,
-        ),
-        cost_model=CostModel(
-            commission_bps=0.5,
-            spread_bps=1.0,
-            slippage_bps=0.5,
-            borrow_bps_annual=40.0,
-        ),
-        experiment_root=artifact_root,
+    walk_forward = WalkForwardConfig(
+        train_bars=504,
+        test_bars=63,
+        step_bars=63,
+        bars_per_year=252,
+        purge_bars=purge_bars,
+        embargo_bars=embargo_bars,
+    )
+    cost_model = CostModel(
+        commission_bps=0.5,
+        spread_bps=1.0,
+        slippage_bps=0.75,
+        market_impact_bps=0.75,
+        borrow_bps_annual=40.0,
+        delay_bars=1,
+    )
+    broker = _build_broker(
+        max_gross_leverage=1.5,
+        max_net_leverage=1.0,
+        max_turnover=1.0,
+        cost_model=cost_model,
     )
 
-    result = backtester.run(experiment_name=experiment_name)
-    visuals = ExperimentVisualizer(result.artifact_dir / "visuals").create_dashboard(result)
-    return {
-        "result": result,
-        "visuals": visuals,
-        "summary": json_ready(result.summary),
-    }
+    trial_strategies = _build_stat_arb_trial_grid(
+        sector_map=sector_map,
+        daily_sentiment=daily_sentiment,
+        experiment_name=experiment_name,
+    )
+    return _run_pipeline_with_validation(
+        pipeline=pipeline,
+        prices=prices,
+        config=walk_forward,
+        cost_model=cost_model,
+        broker=broker,
+        experiment_name=experiment_name,
+        artifact_root=artifact_root,
+        trial_strategies=trial_strategies,
+        validation_config=ValidationConfig(
+            purge_bars=purge_bars,
+            embargo_bars=embargo_bars,
+            pbo_partitions=pbo_partitions,
+        ),
+    )
 
 
 def run_directional_pipeline(
@@ -291,6 +585,9 @@ def run_directional_pipeline(
     breakout_window: int = 55,
     breakout_exit_window: int = 20,
     strategy_cost_bps: float = 2.0,
+    purge_bars: int = 5,
+    embargo_bars: int = 0,
+    pbo_partitions: int = 8,
 ) -> dict[str, Any]:
     if not symbols:
         raise ValueError("Directional pipelines require at least one symbol.")
@@ -332,31 +629,201 @@ def run_directional_pipeline(
         name=pipeline_name,
     )
 
-    backtester = WalkForwardBacktester(
-        strategy=pipeline,
-        prices=prices,
-        config=WalkForwardConfig(
-            train_bars=train_bars,
-            test_bars=test_bars,
-            step_bars=step_bars,
-            bars_per_year=bars_per_year,
-        ),
-        cost_model=CostModel(
-            commission_bps=0.5,
-            spread_bps=1.0,
-            slippage_bps=0.5,
-            borrow_bps_annual=25.0,
-        ),
-        experiment_root=artifact_root,
+    walk_forward = WalkForwardConfig(
+        train_bars=train_bars,
+        test_bars=test_bars,
+        step_bars=step_bars,
+        bars_per_year=bars_per_year,
+        purge_bars=purge_bars,
+        embargo_bars=embargo_bars,
+    )
+    cost_model = CostModel(
+        commission_bps=0.5,
+        spread_bps=1.0,
+        slippage_bps=0.75,
+        market_impact_bps=0.5,
+        borrow_bps_annual=25.0,
+        delay_bars=1,
+    )
+    broker = _build_broker(
+        max_gross_leverage=1.25,
+        max_net_leverage=1.0,
+        max_turnover=1.0,
+        cost_model=cost_model,
     )
 
-    result = backtester.run(experiment_name=pipeline_name)
-    visuals = ExperimentVisualizer(result.artifact_dir / "visuals").create_dashboard(result)
-    return {
-        "result": result,
-        "visuals": visuals,
-        "summary": json_ready(result.summary),
-    }
+    return _run_pipeline_with_validation(
+        pipeline=pipeline,
+        prices=prices,
+        config=walk_forward,
+        cost_model=cost_model,
+        broker=broker,
+        experiment_name=pipeline_name,
+        artifact_root=artifact_root,
+        validation_config=ValidationConfig(
+            purge_bars=purge_bars,
+            embargo_bars=embargo_bars,
+            pbo_partitions=pbo_partitions,
+        ),
+    )
+
+
+def run_etf_trend_pipeline(
+    symbols: list[str] | None = None,
+    start: str = "2010-01-01",
+    end: str = "2026-04-15",
+    interval: str = "1d",
+    experiment_name: str = "etf_trend_momentum",
+    price_cache_dir: str = "data/cache",
+    artifact_root: str = "artifacts/experiments",
+    purge_bars: int = 5,
+    embargo_bars: int = 0,
+    pbo_partitions: int = 8,
+) -> dict[str, Any]:
+    symbols = list(dict.fromkeys(symbols or DEFAULT_ETF_UNIVERSE))
+    price_provider = CachedParquetProvider(
+        upstream=YahooFinanceProvider(),
+        cache_dir=price_cache_dir,
+    )
+    prices = price_provider.get_close_prices(
+        symbols=symbols,
+        start=start,
+        end=end,
+        interval=interval,
+    )
+
+    pipeline = ETFTrendMomentumPipeline(
+        ETFMomentumConfig.from_symbols(symbols),
+        name=experiment_name,
+    )
+    walk_forward = WalkForwardConfig(
+        train_bars=756,
+        test_bars=63,
+        step_bars=21,
+        bars_per_year=252,
+        purge_bars=purge_bars,
+        embargo_bars=embargo_bars,
+    )
+    cost_model = CostModel(
+        commission_bps=0.5,
+        spread_bps=0.75,
+        slippage_bps=0.75,
+        market_impact_bps=0.50,
+        borrow_bps_annual=0.0,
+        delay_bars=1,
+    )
+    broker = _build_broker(
+        max_gross_leverage=1.0,
+        max_net_leverage=1.0,
+        max_turnover=1.0,
+        cost_model=cost_model,
+    )
+
+    return _run_pipeline_with_validation(
+        pipeline=pipeline,
+        prices=prices,
+        config=walk_forward,
+        cost_model=cost_model,
+        broker=broker,
+        experiment_name=experiment_name,
+        artifact_root=artifact_root,
+        trial_strategies=_build_etf_trial_grid(symbols, experiment_name),
+        validation_config=ValidationConfig(
+            purge_bars=purge_bars,
+            embargo_bars=embargo_bars,
+            pbo_partitions=pbo_partitions,
+        ),
+    )
+
+
+def run_event_driven_pipeline(
+    symbols: list[str] | None = None,
+    start: str = "2018-01-01",
+    end: str = "2026-04-15",
+    interval: str = "1d",
+    experiment_name: str = "edgar_event_drift",
+    price_cache_dir: str = "data/cache",
+    event_cache_dir: str = "data/event_cache",
+    artifact_root: str = "artifacts/experiments",
+    event_file: str | None = None,
+    edgar_user_agent: str | None = None,
+    use_sec_companyfacts: bool = False,
+    purge_bars: int = 5,
+    embargo_bars: int = 0,
+    pbo_partitions: int = 8,
+) -> dict[str, Any]:
+    symbols = list(dict.fromkeys(symbols or DEFAULT_EVENT_SYMBOLS))
+    price_provider = CachedParquetProvider(
+        upstream=YahooFinanceProvider(),
+        cache_dir=price_cache_dir,
+    )
+    prices = price_provider.get_close_prices(
+        symbols=symbols,
+        start=start,
+        end=end,
+        interval=interval,
+    )
+    events = load_events(
+        tickers=symbols,
+        start=start,
+        end=end,
+        event_file=event_file,
+        event_cache_dir=event_cache_dir,
+        edgar_user_agent=edgar_user_agent,
+        use_sec_companyfacts=use_sec_companyfacts,
+    )
+    if events is None:
+        raise ValueError("Event-driven backtests require --event-file or --use-sec-companyfacts with --edgar-user-agent.")
+
+    pipeline = EventDrivenPipeline(
+        events=events,
+        portfolio_manager=PortfolioManager(
+            max_leverage=1.25,
+            risk_per_trade=0.05,
+            volatility_window=15,
+            max_strategy_weight=0.25,
+        ),
+        config=EventDrivenConfig.from_symbols(symbols),
+        name=experiment_name,
+    )
+    walk_forward = WalkForwardConfig(
+        train_bars=504,
+        test_bars=63,
+        step_bars=21,
+        bars_per_year=252,
+        purge_bars=purge_bars,
+        embargo_bars=embargo_bars,
+    )
+    cost_model = CostModel(
+        commission_bps=0.5,
+        spread_bps=1.0,
+        slippage_bps=1.0,
+        market_impact_bps=0.75,
+        borrow_bps_annual=30.0,
+        delay_bars=1,
+    )
+    broker = _build_broker(
+        max_gross_leverage=1.25,
+        max_net_leverage=1.0,
+        max_turnover=1.5,
+        cost_model=cost_model,
+    )
+
+    return _run_pipeline_with_validation(
+        pipeline=pipeline,
+        prices=prices,
+        config=walk_forward,
+        cost_model=cost_model,
+        broker=broker,
+        experiment_name=experiment_name,
+        artifact_root=artifact_root,
+        trial_strategies=_build_event_trial_grid(symbols=symbols, events=events, experiment_name=experiment_name),
+        validation_config=ValidationConfig(
+            purge_bars=purge_bars,
+            embargo_bars=embargo_bars,
+            pbo_partitions=pbo_partitions,
+        ),
+    )
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -364,10 +831,17 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--pipeline",
         default="stat_arb",
-        choices=["stat_arb", "ma_cross", "rsi_mean_reversion", "donchian_breakout"],
+        choices=[
+            "stat_arb",
+            "etf_trend",
+            "edgar_event",
+            "ma_cross",
+            "rsi_mean_reversion",
+            "donchian_breakout",
+        ],
         help="Research pipeline to run.",
     )
-    parser.add_argument("--symbols", nargs="*", help="Symbols for directional pipelines.")
+    parser.add_argument("--symbols", nargs="*", help="Symbols for directional, ETF, or event pipelines.")
     parser.add_argument("--sector-map", help="Path to JSON or CSV sector map.")
     parser.add_argument("--start", default="2018-01-01", help="Backtest start date (YYYY-MM-DD).")
     parser.add_argument("--end", default="2026-04-15", help="Backtest end date (YYYY-MM-DD).")
@@ -377,6 +851,9 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--test-bars", type=int, default=63, help="Test bars per walk-forward fold.")
     parser.add_argument("--step-bars", type=int, default=63, help="Walk-forward step size.")
     parser.add_argument("--bars-per-year", type=int, default=252, help="Bars per year for annualization.")
+    parser.add_argument("--validation-purge-bars", type=int, default=5, help="Purge bars between train and test windows.")
+    parser.add_argument("--validation-embargo-bars", type=int, default=0, help="Embargo bars after each test window.")
+    parser.add_argument("--validation-pbo-partitions", type=int, default=8, help="Number of partitions for CSCV/PBO.")
     parser.add_argument(
         "--news-provider",
         nargs="+",
@@ -391,9 +868,13 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--news-topics", nargs="*", help="Optional topic filters for providers that support them.")
     parser.add_argument("--use-finbert", action="store_true", help="Use FinBERT for headline sentiment.")
     parser.add_argument("--local-finbert-only", action="store_true", help="Require FinBERT to already exist locally.")
+    parser.add_argument("--event-file", help="CSV or parquet of standardized event data.")
+    parser.add_argument("--use-sec-companyfacts", action="store_true", help="Build EDGAR events from SEC company facts.")
+    parser.add_argument("--edgar-user-agent", help="User-Agent string for SEC requests, e.g. 'YourName [email@example.com]'.")
     parser.add_argument("--artifact-root", default="artifacts/experiments", help="Experiment artifact directory.")
     parser.add_argument("--price-cache-dir", default="data/cache", help="Price parquet cache directory.")
     parser.add_argument("--sentiment-cache-dir", default="data/sentiment_cache", help="Sentiment cache directory.")
+    parser.add_argument("--event-cache-dir", default="data/event_cache", help="Event cache directory.")
     parser.add_argument("--fast-window", type=int, default=20, help="Fast MA window for ma_cross.")
     parser.add_argument("--slow-window", type=int, default=80, help="Slow MA window for ma_cross.")
     parser.add_argument("--rsi-window", type=int, default=14, help="RSI window for rsi_mean_reversion.")
@@ -430,6 +911,39 @@ def main() -> None:
             alphavantage_api_key=args.alphavantage_api_key,
             benzinga_api_key=args.benzinga_api_key,
             news_topics=args.news_topics,
+            purge_bars=args.validation_purge_bars,
+            embargo_bars=args.validation_embargo_bars,
+            pbo_partitions=args.validation_pbo_partitions,
+        )
+    elif args.pipeline == "etf_trend":
+        run_output = run_etf_trend_pipeline(
+            symbols=args.symbols,
+            start=args.start,
+            end=args.end,
+            interval=args.interval,
+            experiment_name=experiment_name,
+            price_cache_dir=args.price_cache_dir,
+            artifact_root=args.artifact_root,
+            purge_bars=args.validation_purge_bars,
+            embargo_bars=args.validation_embargo_bars,
+            pbo_partitions=args.validation_pbo_partitions,
+        )
+    elif args.pipeline == "edgar_event":
+        run_output = run_event_driven_pipeline(
+            symbols=args.symbols,
+            start=args.start,
+            end=args.end,
+            interval=args.interval,
+            experiment_name=experiment_name,
+            price_cache_dir=args.price_cache_dir,
+            event_cache_dir=args.event_cache_dir,
+            artifact_root=args.artifact_root,
+            event_file=args.event_file,
+            edgar_user_agent=args.edgar_user_agent,
+            use_sec_companyfacts=args.use_sec_companyfacts,
+            purge_bars=args.validation_purge_bars,
+            embargo_bars=args.validation_embargo_bars,
+            pbo_partitions=args.validation_pbo_partitions,
         )
     else:
         if not args.symbols:
@@ -456,12 +970,16 @@ def main() -> None:
             breakout_window=args.breakout_window,
             breakout_exit_window=args.breakout_exit_window,
             strategy_cost_bps=args.strategy_cost_bps,
+            purge_bars=args.validation_purge_bars,
+            embargo_bars=args.validation_embargo_bars,
+            pbo_partitions=args.validation_pbo_partitions,
         )
 
     result: ExperimentResult = run_output["result"]
     visuals = run_output["visuals"]
 
     print(json.dumps(run_output["summary"], indent=2))
+    print(json.dumps(run_output["validation"], indent=2))
     print(f"Artifacts saved to: {result.artifact_dir}")
     for name, path in visuals.items():
         print(f"{name}: {path}")

@@ -118,6 +118,51 @@ def synthetic_directional_prices() -> pd.DataFrame:
     )
 
 
+def synthetic_etf_prices() -> pd.DataFrame:
+    rng = np.random.default_rng(29)
+    index = pd.date_range("2016-01-01", periods=900, freq="B")
+    phase = np.arange(len(index))
+
+    spy = 200 + np.cumsum(rng.normal(0.08, 0.55, len(index)))
+    qqq = 150 + np.cumsum(rng.normal(0.11, 0.70, len(index)))
+    tlt = 120 + np.cumsum(rng.normal(0.01, 0.35, len(index)))
+    gld = 110 + np.cumsum(rng.normal(0.03, 0.30, len(index)))
+    xle = 70 + np.cumsum(rng.normal(0.02 + 0.02 * np.sin(phase / 80.0), 0.80, len(index)))
+    xlf = 60 + np.cumsum(rng.normal(0.05, 0.50, len(index)))
+
+    return pd.DataFrame(
+        {
+            "SPY": pd.Series(spy, index=index).abs() + 20,
+            "QQQ": pd.Series(qqq, index=index).abs() + 20,
+            "TLT": pd.Series(tlt, index=index).abs() + 20,
+            "GLD": pd.Series(gld, index=index).abs() + 20,
+            "XLE": pd.Series(xle, index=index).abs() + 20,
+            "XLF": pd.Series(xlf, index=index).abs() + 20,
+        },
+        index=index,
+    )
+
+
+def synthetic_event_panel(index: pd.Index, symbols: list[str]) -> pd.DataFrame:
+    rows: list[dict[str, object]] = []
+    timestamps = pd.DatetimeIndex(index)
+    for symbol_index, symbol in enumerate(symbols):
+        for offset in range(40, len(timestamps), 90):
+            score = 0.45 if (offset // 90 + symbol_index) % 2 == 0 else -0.35
+            rows.append(
+                {
+                    "timestamp": timestamps[offset],
+                    "ticker": symbol,
+                    "event_score": score,
+                    "confidence": 0.8,
+                    "event_type": "synthetic_filing",
+                    "source": "unit_test",
+                    "form": "10-Q",
+                }
+            )
+    return pd.DataFrame(rows)
+
+
 def fresh_test_dir(relative_path: str) -> Path:
     path = Path(relative_path)
     if path.exists():
