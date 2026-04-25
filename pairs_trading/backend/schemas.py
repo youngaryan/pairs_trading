@@ -16,9 +16,21 @@ class PaperRunRequest(BaseModel):
         default=None,
         description="Optional path to a paper deployment config. Defaults to backend settings.",
     )
+    deployment_config: dict[str, Any] | None = Field(
+        default=None,
+        description="Optional inline paper deployment config with execution settings and strategy specs.",
+    )
     asof_date: str | None = Field(
         default=None,
         description="Optional paper run as-of date, formatted as YYYY-MM-DD.",
+    )
+    asof_start: str | None = Field(
+        default=None,
+        description="Optional start date for a business-day paper replay range.",
+    )
+    asof_end: str | None = Field(
+        default=None,
+        description="Optional end date for a business-day paper replay range.",
     )
 
 

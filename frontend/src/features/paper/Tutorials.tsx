@@ -34,12 +34,12 @@ const tutorialCards = [
     note: "Use this for research experiments before adding anything to the paper deployment config."
   },
   {
-    title: "5. Run a paper batch",
+    title: "5. Deploy fake-money agents",
     icon: <Play size={18} />,
     body:
-      "Run Batch asks the backend to read the deployment config, rebuild signals, simulate orders, update each ledger, and refresh the dashboard payload.",
-    command: ".\\.venv\\Scripts\\python.exe -m pairs_trading.apps.cli --deploy-paper-config examples/paper_deployment.sample.json",
-    note: "The button does the same operation through POST /api/paper/run."
+      "The Live Trading tab lets you deploy several paper agents at once. Configure method, symbols, timeframe, date mode, execution costs, and optional sentiment/news settings before launching.",
+    command: "POST http://127.0.0.1:8000/api/paper/run-job",
+    note: "Use single date for today-style shadow execution, or date range replay to simulate multiple business days in sequence."
   },
   {
     title: "6. Inspect every strategy",
@@ -62,7 +62,11 @@ const tutorialCards = [
 const pageExplanations = [
   {
     name: "Overview",
-    explanation: "Fast health check: total capital, strategy leaderboard, and the currently selected strategy chart."
+    explanation: "Fast health check: total capital, equity/PnL charts, exposure, capital allocation, leaderboard, and selected strategy detail."
+  },
+  {
+    name: "Live Trading",
+    explanation: "Shadow paper execution control room. Configure multiple agents, symbols, timeframes, sentiment overlays, replay dates, fake broker costs, and job progress."
   },
   {
     name: "Strategies",
@@ -125,6 +129,45 @@ const backtestTerms = [
   }
 ];
 
+const liveTradingTerms = [
+  {
+    name: "Shadow live",
+    explanation: "A fake-money rehearsal. The app runs current signals and simulated execution, but it does not send orders to a real broker."
+  },
+  {
+    name: "Run control",
+    explanation: "The panel where you choose single-date or date-range replay, set fake broker assumptions, and launch the paper live job."
+  },
+  {
+    name: "Agent deployment builder",
+    explanation: "The area where each fake-money agent gets a method, symbols or sector map, timeframe, lookback, and strategy parameters."
+  },
+  {
+    name: "Date range replay",
+    explanation: "Runs every business day between the selected start and end dates, updating ledgers sequentially like a rehearsal of live operations."
+  },
+  {
+    name: "Sentiment/news overlay",
+    explanation: "Optional news settings passed to news-aware pipelines, including local daily sentiment files, provider names, news files, topics, and FinBERT scoring."
+  },
+  {
+    name: "Deployment charts",
+    explanation: "Charts that show configured methods, sentiment coverage, symbol coverage, fake broker assumptions, equity trail, exposure, order notional, and risk/return."
+  },
+  {
+    name: "Execution progress",
+    explanation: "Shows whether the backend is loading config, building signals, simulating orders, or saving ledgers."
+  },
+  {
+    name: "Ledger",
+    explanation: "A saved fake-money account per strategy with cash, positions, equity, latest orders, and history."
+  },
+  {
+    name: "Latest orders",
+    explanation: "The simulated broker orders from the most recent run. They include notional, quantity, commission, and execution price."
+  }
+];
+
 const promotionSteps = [
   "Run the simplest benchmark first, usually buy_and_hold or ETF trend.",
   "Run the candidate strategy with conservative costs and purged validation.",
@@ -180,6 +223,21 @@ export function Tutorials() {
         </div>
         <div className="page-guide">
           {backtestTerms.map((term) => (
+            <div key={term.name} className="page-guide__row">
+              <strong>{term.name}</strong>
+              <span>{term.explanation}</span>
+            </div>
+          ))}
+        </div>
+      </section>
+
+      <section className="panel">
+        <div className="panel__header">
+          <h2>Live Trading Glossary</h2>
+          <span>{liveTradingTerms.length} terms</span>
+        </div>
+        <div className="page-guide">
+          {liveTradingTerms.map((term) => (
             <div key={term.name} className="page-guide__row">
               <strong>{term.name}</strong>
               <span>{term.explanation}</span>

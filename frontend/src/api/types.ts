@@ -80,6 +80,60 @@ export interface PaperDashboardPayload {
   visuals: Record<string, unknown>;
 }
 
+export interface PaperRunJob {
+  id: string;
+  status: "queued" | "running" | "completed" | "failed" | "interrupted" | string;
+  request: Record<string, unknown>;
+  created_at_utc: string;
+  updated_at_utc: string;
+  progress: number;
+  stage: string;
+  message: string;
+  started_at_utc?: string | null;
+  finished_at_utc?: string | null;
+  result?: (PaperDashboardPayload & { run_sequence?: { dates: Array<string | null>; count: number; deployment_config_path: string } }) | null;
+  error?: string | null;
+}
+
+export interface PaperExecutionConfig {
+  initial_cash: number;
+  commission_bps: number;
+  slippage_bps: number;
+  min_trade_notional: number;
+  weight_tolerance: number;
+}
+
+export interface PaperAgentConfig {
+  id: string;
+  name: string;
+  pipeline: string;
+  symbols: string[];
+  interval: string;
+  lookback_bars: number;
+  sector_map_path?: string | null;
+  event_file?: string | null;
+  use_sec_companyfacts?: boolean;
+  edgar_user_agent?: string | null;
+  daily_sentiment_file?: string | null;
+  news_provider_names?: string[];
+  news_files?: string[];
+  use_finbert?: boolean;
+  local_finbert_only?: boolean;
+  news_topics?: string[];
+  params: Record<string, unknown>;
+}
+
+export interface PaperRunRequest {
+  deployment_config_path?: string | null;
+  deployment_config?: {
+    execution: PaperExecutionConfig;
+    strategies: Array<Record<string, unknown>>;
+  } | null;
+  asof_date?: string | null;
+  asof_start?: string | null;
+  asof_end?: string | null;
+}
+
 export interface HealthResponse {
   status: string;
   service: string;

@@ -4,6 +4,8 @@ import type {
   BacktestTemplate,
   HealthResponse,
   PaperDashboardPayload,
+  PaperRunRequest,
+  PaperRunJob,
   PaperStrategy,
   StrategyCatalogItem
 } from "./types";
@@ -48,6 +50,21 @@ export function runPaperBatch(asofDate?: string) {
     method: "POST",
     body: JSON.stringify({ asof_date: asofDate || null })
   });
+}
+
+export function startPaperRunJob(request?: PaperRunRequest) {
+  return requestJson<PaperRunJob>("/api/paper/run-job", {
+    method: "POST",
+    body: JSON.stringify(request ?? {})
+  });
+}
+
+export function listPaperRunJobs() {
+  return requestJson<PaperRunJob[]>("/api/paper/jobs");
+}
+
+export function getPaperRunJob(jobId: string) {
+  return requestJson<PaperRunJob>(`/api/paper/jobs/${encodeURIComponent(jobId)}`);
 }
 
 export function getStrategyCatalog() {

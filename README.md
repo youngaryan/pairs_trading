@@ -17,6 +17,7 @@ The architecture follows a modular flow:
 - `frontend/`: Vite React TypeScript operations console
 
 More detail lives in [docs/architecture.md](docs/architecture.md).
+The end-to-end backend/frontend tutorial lives in [docs/backend_frontend_tutorial.md](docs/backend_frontend_tutorial.md).
 Backend/frontend instructions live in [docs/fullstack_workflows.md](docs/fullstack_workflows.md).
 Strategy explanations live in [docs/strategy_catalog.md](docs/strategy_catalog.md) and are also exposed in the web dashboard.
 Interactive backtest agent workflows live in [docs/backtest_agent_workbench.md](docs/backtest_agent_workbench.md).

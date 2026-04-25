@@ -10,6 +10,8 @@ from threading import Lock
 from typing import Any
 from uuid import uuid4
 
+import pandas as pd
+
 from ..api import build_paper_dashboard_payload
 from ..apps.cli import (
     DIRECTIONAL_PIPELINES,
@@ -27,7 +29,243 @@ from .schemas import BacktestRunRequest
 @dataclass(frozen=True)
 class PaperRunCommand:
     deployment_config_path: Path | None = None
+    deployment_config: dict[str, Any] | None = None
     asof_date: str | None = None
+    asof_start: str | None = None
+    asof_end: str | None = None
+
+
+@dataclass
+class PaperRunJob:
+    id: str
+    status: str
+    request: dict[str, Any]
+    created_at_utc: str
+    updated_at_utc: str
+    progress: float = 0.0
+    stage: str = "queued"
+    message: str = "Waiting for a paper worker."
+    started_at_utc: str | None = None
+    finished_at_utc: str | None = None
+    result: dict[str, Any] | None = None
+    error: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "status": self.status,
+            "request": self.request,
+            "created_at_utc": self.created_at_utc,
+            "updated_at_utc": self.updated_at_utc,
+            "progress": self.progress,
+            "stage": self.stage,
+            "message": self.message,
+            "started_at_utc": self.started_at_utc,
+            "finished_at_utc": self.finished_at_utc,
+            "result": self.result,
+            "error": self.error,
+        }
+
+
+class PaperRunJobRunner:
+    def __init__(self, settings: BackendSettings, *, max_workers: int = 1, max_history: int = 50) -> None:
+        self.settings = settings
+        self.max_history = max_history
+        self.executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="paper-live")
+        self.lock = Lock()
+        self.jobs: dict[str, PaperRunJob] = {}
+        self.jobs_dir = settings.paper_job_state_dir
+        self.jobs_dir.mkdir(parents=True, exist_ok=True)
+        self._load_jobs()
+
+    def submit(self, command: PaperRunCommand) -> dict[str, Any]:
+        if command.deployment_config is not None:
+            strategies = command.deployment_config.get("strategies", [])
+            if not isinstance(strategies, list) or not strategies:
+                raise ValueError("Inline paper deployment config must include at least one strategy.")
+        config_path = command.deployment_config_path or (None if command.deployment_config is not None else self.settings.default_paper_config)
+        if config_path is not None and not config_path.exists():
+            raise FileNotFoundError(f"Paper deployment config not found: {config_path}")
+
+        now = _utc_now_iso()
+        job = PaperRunJob(
+            id=uuid4().hex,
+            status="queued",
+            request={
+                "deployment_config_path": str(command.deployment_config_path) if command.deployment_config_path else None,
+                "deployment_config": command.deployment_config,
+                "asof_date": command.asof_date,
+                "asof_start": command.asof_start,
+                "asof_end": command.asof_end,
+            },
+            created_at_utc=now,
+            updated_at_utc=now,
+            progress=0.02,
+            stage="queued",
+            message="Queued paper execution. Waiting for the shadow broker worker.",
+        )
+        with self.lock:
+            self.jobs[job.id] = job
+            self._save_locked(job)
+            self._trim_locked()
+
+        future = self.executor.submit(self._run_job, job.id, command)
+        future.add_done_callback(lambda completed: self._finalize_unhandled(job.id, completed))
+        return job.to_dict()
+
+    def list_jobs(self) -> list[dict[str, Any]]:
+        with self.lock:
+            return [job.to_dict() for job in sorted(self.jobs.values(), key=lambda item: item.created_at_utc, reverse=True)]
+
+    def get_job(self, job_id: str) -> dict[str, Any] | None:
+        with self.lock:
+            job = self.jobs.get(job_id)
+            return None if job is None else job.to_dict()
+
+    def _set_status(self, job_id: str, status: str, **updates: Any) -> None:
+        now = _utc_now_iso()
+        with self.lock:
+            job = self.jobs[job_id]
+            job.status = status
+            job.updated_at_utc = now
+            for key, value in updates.items():
+                setattr(job, key, value)
+            self._save_locked(job)
+
+    def _deployment_config_path(self, job_id: str, command: PaperRunCommand) -> Path:
+        if command.deployment_config is None:
+            return command.deployment_config_path or self.settings.default_paper_config
+        path = self.jobs_dir / f"{job_id}_deployment.json"
+        path.write_text(json.dumps(json_ready(command.deployment_config), indent=2), encoding="utf-8")
+        return path
+
+    @staticmethod
+    def _asof_dates(command: PaperRunCommand) -> list[str | None]:
+        if command.asof_start and command.asof_end:
+            dates = pd.bdate_range(start=command.asof_start, end=command.asof_end)
+            if dates.empty:
+                raise ValueError("Date range did not contain any business days.")
+            return [date.strftime("%Y-%m-%d") for date in dates]
+        return [command.asof_date]
+
+    def _run_job(self, job_id: str, command: PaperRunCommand) -> None:
+        self._set_status(
+            job_id,
+            "running",
+            started_at_utc=_utc_now_iso(),
+            progress=0.10,
+            stage="loading_config",
+            message="Loading deployment config and execution settings.",
+        )
+        try:
+            config_path = self._deployment_config_path(job_id, command)
+            asof_dates = self._asof_dates(command)
+            self._set_status(
+                job_id,
+                "running",
+                progress=0.25,
+                stage="building_signals",
+                message=f"Preparing {len(asof_dates)} paper execution date(s) from deployment config.",
+            )
+            service = PaperService(self.settings)
+            result: dict[str, Any] | None = None
+            completed_dates: list[str | None] = []
+            total_dates = len(asof_dates)
+            for index, asof_date in enumerate(asof_dates):
+                fraction = index / max(total_dates, 1)
+                self._set_status(
+                    job_id,
+                    "running",
+                    progress=0.30 + 0.50 * fraction,
+                    stage="simulating_orders",
+                    message=f"Running paper execution {index + 1} of {total_dates} for {asof_date or 'today'}.",
+                )
+                result = service.run_paper_batch(
+                    PaperRunCommand(
+                        deployment_config_path=config_path,
+                        asof_date=asof_date,
+                    )
+                )
+                completed_dates.append(asof_date)
+            self._set_status(
+                job_id,
+                "running",
+                progress=0.88,
+                stage="saving_ledgers",
+                message="Saving fake-money ledgers, latest orders, dashboards, and API payload.",
+            )
+            result = result or service.build_dashboard_payload()
+            result["run_sequence"] = {
+                "dates": completed_dates,
+                "count": len(completed_dates),
+                "deployment_config_path": str(config_path),
+            }
+        except Exception as exc:  # pragma: no cover - covered by API-level tests
+            self._set_status(
+                job_id,
+                "failed",
+                error=str(exc),
+                progress=1.0,
+                stage="failed",
+                message="Paper execution failed. Review the error and deployment config.",
+                finished_at_utc=_utc_now_iso(),
+            )
+            return
+        self._set_status(
+            job_id,
+            "completed",
+            result=result,
+            progress=1.0,
+            stage="completed",
+            message="Paper execution completed. Ledgers and dashboard payload are updated.",
+            finished_at_utc=_utc_now_iso(),
+        )
+
+    def _finalize_unhandled(self, job_id: str, future: Future[None]) -> None:
+        exception = future.exception()
+        if exception is None:
+            return
+        self._set_status(
+            job_id,
+            "failed",
+            error=str(exception),
+            progress=1.0,
+            stage="failed",
+            message="The paper worker crashed before returning a result.",
+            finished_at_utc=_utc_now_iso(),
+        )
+
+    def _save_locked(self, job: PaperRunJob) -> None:
+        path = self.jobs_dir / f"{job.id}.json"
+        tmp_path = path.with_suffix(".tmp")
+        tmp_path.write_text(json.dumps(json_ready(job.to_dict()), indent=2), encoding="utf-8")
+        tmp_path.replace(path)
+
+    def _load_jobs(self) -> None:
+        for path in sorted(self.jobs_dir.glob("*.json")):
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                job = PaperRunJob(**payload)
+            except Exception:
+                continue
+            if job.status in {"queued", "running"}:
+                job.status = "interrupted"
+                job.stage = "interrupted"
+                job.progress = 1.0
+                job.message = "The backend restarted before this paper run finished. Please rerun it."
+                job.finished_at_utc = job.finished_at_utc or _utc_now_iso()
+            self.jobs[job.id] = job
+
+    def _trim_locked(self) -> None:
+        if len(self.jobs) <= self.max_history:
+            return
+        removable = sorted(self.jobs.values(), key=lambda item: item.created_at_utc)[: len(self.jobs) - self.max_history]
+        for job in removable:
+            self.jobs.pop(job.id, None)
+            try:
+                (self.jobs_dir / f"{job.id}.json").unlink()
+            except FileNotFoundError:
+                pass
 
 
 def _utc_now_iso() -> str:
@@ -541,17 +779,35 @@ class PaperService:
         return None
 
     def run_paper_batch(self, command: PaperRunCommand) -> dict[str, Any]:
-        config_path = command.deployment_config_path or self.settings.default_paper_config
+        if command.deployment_config is not None:
+            deployment_dir = self.settings.paper_artifact_root.parent / "inline_deployments"
+            deployment_dir.mkdir(parents=True, exist_ok=True)
+            config_path = deployment_dir / f"{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}_deployment.json"
+            config_path.write_text(json.dumps(json_ready(command.deployment_config), indent=2), encoding="utf-8")
+        else:
+            config_path = command.deployment_config_path or self.settings.default_paper_config
         if not config_path.exists():
             raise FileNotFoundError(f"Paper deployment config not found: {config_path}")
 
-        summary = run_paper_batch(
-            deployment_config_path=config_path,
-            asof_date=command.asof_date,
-            state_dir=self.settings.paper_state_dir,
-            artifact_root=self.settings.paper_artifact_root,
-            price_cache_dir=str(self.settings.price_cache_dir),
-            sentiment_cache_dir=str(self.settings.sentiment_cache_dir),
-            event_cache_dir=str(self.settings.event_cache_dir),
-        )
-        return self.build_dashboard_payload(batch_summary_path=summary.get("artifact_dir") and Path(summary["artifact_dir"]) / "paper_batch_summary.json")
+        asof_dates = PaperRunJobRunner._asof_dates(command)
+        latest_payload: dict[str, Any] | None = None
+        completed_dates: list[str | None] = []
+        for asof_date in asof_dates:
+            summary = run_paper_batch(
+                deployment_config_path=config_path,
+                asof_date=asof_date,
+                state_dir=self.settings.paper_state_dir,
+                artifact_root=self.settings.paper_artifact_root,
+                price_cache_dir=str(self.settings.price_cache_dir),
+                sentiment_cache_dir=str(self.settings.sentiment_cache_dir),
+                event_cache_dir=str(self.settings.event_cache_dir),
+            )
+            latest_payload = self.build_dashboard_payload(batch_summary_path=summary.get("artifact_dir") and Path(summary["artifact_dir"]) / "paper_batch_summary.json")
+            completed_dates.append(asof_date)
+        latest_payload = latest_payload or self.build_dashboard_payload()
+        latest_payload["run_sequence"] = {
+            "dates": completed_dates,
+            "count": len(completed_dates),
+            "deployment_config_path": str(config_path),
+        }
+        return latest_payload

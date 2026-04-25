@@ -101,8 +101,8 @@ Passing the decision gate does not mean the strategy is ready for real money. It
 2. Use `Backtests` to launch a research run.
 3. Inspect the decision, chart, validation checks, and artifact paths.
 4. Re-run nearby parameters to test stability.
-5. Only promote promising strategies into `examples/paper_deployment.sample.json`.
-6. Use `Run Batch` for fake-money shadow trading after the backtest passes basic checks.
+5. Only promote promising strategies into `examples/paper_deployment.sample.json` or the `Live Trading` deployment builder.
+6. Use `Live Trading` -> `Deploy Agents` for fake-money shadow trading after the backtest passes basic checks.
 
 ## Validation Checklist
 

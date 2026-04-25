@@ -7,12 +7,13 @@ from fastapi import APIRouter, HTTPException, Query
 
 from ..config import BackendSettings
 from ..schemas import PaperRunRequest
-from ..services import PaperRunCommand, PaperService
+from ..services import PaperRunCommand, PaperRunJobRunner, PaperService
 
 
 def build_paper_router(settings: BackendSettings) -> APIRouter:
     router = APIRouter(prefix="/paper", tags=["paper"])
     service = PaperService(settings)
+    runner = PaperRunJobRunner(settings)
 
     @router.get("/summary")
     def get_summary(
@@ -42,10 +43,43 @@ def build_paper_router(settings: BackendSettings) -> APIRouter:
             return service.run_paper_batch(
                 PaperRunCommand(
                     deployment_config_path=Path(request.deployment_config_path) if request.deployment_config_path else None,
+                    deployment_config=request.deployment_config,
                     asof_date=request.asof_date,
+                    asof_start=request.asof_start,
+                    asof_end=request.asof_end,
                 )
             )
         except FileNotFoundError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @router.post("/run-job", status_code=202)
+    def run_batch_job(request: PaperRunRequest) -> dict[str, Any]:
+        try:
+            return runner.submit(
+                PaperRunCommand(
+                    deployment_config_path=Path(request.deployment_config_path) if request.deployment_config_path else None,
+                    deployment_config=request.deployment_config,
+                    asof_date=request.asof_date,
+                    asof_start=request.asof_start,
+                    asof_end=request.asof_end,
+                )
+            )
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @router.get("/jobs")
+    def list_jobs() -> list[dict[str, Any]]:
+        return runner.list_jobs()
+
+    @router.get("/jobs/{job_id}")
+    def get_job(job_id: str) -> dict[str, Any]:
+        job = runner.get_job(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail=f"Paper job not found: {job_id}")
+        return job
 
     return router

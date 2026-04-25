@@ -15,6 +15,7 @@ def _split_env(value: str | None, default: tuple[str, ...]) -> tuple[str, ...]:
 class BackendSettings:
     paper_state_dir: Path = Path("artifacts/paper/state")
     paper_artifact_root: Path = Path("artifacts/paper/runs")
+    paper_job_state_dir: Path = Path("artifacts/paper/jobs")
     default_paper_config: Path = Path("examples/paper_deployment.sample.json")
     backtest_artifact_root: Path = Path("artifacts/backtests/experiments")
     backtest_job_state_dir: Path = Path("artifacts/backtests/jobs")
@@ -31,6 +32,7 @@ class BackendSettings:
         return cls(
             paper_state_dir=Path(os.getenv("PAIRS_TRADING_PAPER_STATE_DIR", "artifacts/paper/state")),
             paper_artifact_root=Path(os.getenv("PAIRS_TRADING_PAPER_ARTIFACT_ROOT", "artifacts/paper/runs")),
+            paper_job_state_dir=Path(os.getenv("PAIRS_TRADING_PAPER_JOB_STATE_DIR", "artifacts/paper/jobs")),
             default_paper_config=Path(os.getenv("PAIRS_TRADING_PAPER_CONFIG", "examples/paper_deployment.sample.json")),
             backtest_artifact_root=Path(os.getenv("PAIRS_TRADING_BACKTEST_ARTIFACT_ROOT", "artifacts/backtests/experiments")),
             backtest_job_state_dir=Path(os.getenv("PAIRS_TRADING_BACKTEST_JOB_STATE_DIR", "artifacts/backtests/jobs")),

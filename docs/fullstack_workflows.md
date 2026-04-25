@@ -2,6 +2,8 @@
 
 The project now has a Python backend and a React TypeScript frontend.
 
+For the bigger architecture walkthrough, read [backend_frontend_tutorial.md](backend_frontend_tutorial.md).
+
 ## Backend
 
 Install backend dependencies:
@@ -24,6 +26,9 @@ GET  http://127.0.0.1:8000/api/paper/summary
 GET  http://127.0.0.1:8000/api/paper/strategies
 GET  http://127.0.0.1:8000/api/paper/strategies/{strategy_name}
 POST http://127.0.0.1:8000/api/paper/run
+POST http://127.0.0.1:8000/api/paper/run-job
+GET  http://127.0.0.1:8000/api/paper/jobs
+GET  http://127.0.0.1:8000/api/paper/jobs/{job_id}
 GET  http://127.0.0.1:8000/api/strategies/catalog
 GET  http://127.0.0.1:8000/api/strategies/catalog/{strategy_id}
 GET  http://127.0.0.1:8000/api/backtests/templates
@@ -61,8 +66,9 @@ http://127.0.0.1:5173
 
 ## Website Tutorial
 
-The dashboard has six pages:
+The dashboard has eight pages:
 - `Overview`: total fake capital, daily PnL, leaderboard, and a selected strategy chart.
+- `Live Trading`: configure multiple fake-money agents, deploy paper jobs, watch progress, inspect stage messages, and review live equity/order charts.
 - `Strategies`: one-strategy drilldown with target weights, positions, and equity history.
 - `Orders`: latest simulated broker orders with notional, commission, and execution price.
 - `Diagnostics`: raw model metadata for debugging.

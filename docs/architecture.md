@@ -2,6 +2,8 @@
 
 This repo is organized as an early professional quant app. The package layout separates research, data, execution, operations, reporting, and future frontend/API concerns.
 
+For the full backend/frontend walkthrough, read [backend_frontend_tutorial.md](backend_frontend_tutorial.md).
+
 ## Package Layout
 
 - `pairs_trading/core/`: stable contracts and portfolio primitives. Put shared dataclasses, strategy output contracts, and allocation utilities here.
@@ -44,6 +46,9 @@ GET /api/paper/summary
 GET /api/paper/strategies
 GET /api/paper/strategies/{strategy_name}
 POST /api/paper/run
+POST /api/paper/run-job
+GET /api/paper/jobs
+GET /api/paper/jobs/{job_id}
 ```
 
 Keep the backend route layer thin. New frontend screens should usually be backed by a read model in `pairs_trading/api/`, a service in `pairs_trading/backend/services.py` or a nearby service module, and a route adapter in `pairs_trading/backend/routers/`.

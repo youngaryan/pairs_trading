@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from types import SimpleNamespace
 import time
 import unittest
@@ -92,6 +94,145 @@ class BackendBacktestTests(unittest.TestCase):
         jobs = client.get("/api/backtests/jobs")
         self.assertEqual(jobs.status_code, 200)
         self.assertEqual(jobs.json()[0]["id"], job_id)
+
+    def test_paper_run_job_routes_submit_and_complete(self) -> None:
+        from pairs_trading.backend.app import create_app
+        from pairs_trading.backend.config import BackendSettings
+
+        workspace = fresh_test_dir("artifacts/test_backend_paper_jobs")
+        config_path = workspace / "paper_config.json"
+        config_path.write_text('{"execution": {}, "strategies": [{"name": "demo", "pipeline": "etf_trend", "symbols": ["SPY"]}]}', encoding="utf-8")
+
+        app = create_app(
+            BackendSettings(
+                paper_state_dir=workspace / "state",
+                paper_artifact_root=workspace / "paper_runs",
+                paper_job_state_dir=workspace / "paper_jobs",
+                default_paper_config=config_path,
+                price_cache_dir=workspace / "cache",
+            )
+        )
+        client = TestClient(app)
+
+        with patch(
+            "pairs_trading.backend.services.run_paper_batch",
+            return_value={
+                "artifact_dir": str(workspace / "paper_runs" / "fake_batch"),
+                "asof_date": "2026-04-24",
+                "run_timestamp_utc": "20260424T000000Z",
+                "strategies": {},
+                "leaderboard": [],
+            },
+        ) as run_paper:
+            submitted = client.post("/api/paper/run-job", json={"asof_date": "2026-04-24"})
+            self.assertEqual(submitted.status_code, 202)
+            job_id = submitted.json()["id"]
+
+            job_payload = submitted.json()
+            for _ in range(40):
+                job = client.get(f"/api/paper/jobs/{job_id}")
+                self.assertEqual(job.status_code, 200)
+                job_payload = job.json()
+                if job_payload["status"] in {"completed", "failed"}:
+                    break
+                time.sleep(0.05)
+
+            self.assertEqual(job_payload["status"], "completed")
+            self.assertEqual(job_payload["progress"], 1.0)
+            self.assertEqual(job_payload["stage"], "completed")
+            self.assertTrue((workspace / "paper_jobs" / f"{job_id}.json").exists())
+            run_paper.assert_called_once()
+
+        jobs = client.get("/api/paper/jobs")
+        self.assertEqual(jobs.status_code, 200)
+        self.assertEqual(jobs.json()[0]["id"], job_id)
+
+    def test_paper_run_job_accepts_inline_multi_agent_replay(self) -> None:
+        from pairs_trading.backend.app import create_app
+        from pairs_trading.backend.config import BackendSettings
+
+        workspace = fresh_test_dir("artifacts/test_backend_paper_inline_jobs")
+        app = create_app(
+            BackendSettings(
+                paper_state_dir=workspace / "state",
+                paper_artifact_root=workspace / "paper_runs",
+                paper_job_state_dir=workspace / "paper_jobs",
+                default_paper_config=workspace / "not_used.json",
+                price_cache_dir=workspace / "cache",
+            )
+        )
+        client = TestClient(app)
+
+        inline_config = {
+            "execution": {
+                "initial_cash": 250000,
+                "commission_bps": 0.5,
+                "slippage_bps": 1.0,
+                "min_trade_notional": 100,
+                "weight_tolerance": 0.0025,
+            },
+            "strategies": [
+                {
+                    "name": "trend_agent",
+                    "pipeline": "etf_trend",
+                    "symbols": ["SPY", "QQQ", "TLT"],
+                    "interval": "1d",
+                    "lookback_bars": 360,
+                    "params": {"top_n": 2},
+                },
+                {
+                    "name": "stat_arb_agent",
+                    "pipeline": "stat_arb",
+                    "symbols": [],
+                    "sector_map_path": "examples/sector_map.sample.json",
+                    "interval": "1d",
+                    "lookback_bars": 620,
+                    "news_provider_names": ["local"],
+                    "use_finbert": True,
+                    "params": {"include_residual_book": True, "top_n_pairs": 3},
+                },
+            ],
+        }
+
+        with patch(
+            "pairs_trading.backend.services.run_paper_batch",
+            return_value={
+                "artifact_dir": str(workspace / "paper_runs" / "fake_batch"),
+                "asof_date": "2026-04-24",
+                "run_timestamp_utc": "20260424T000000Z",
+                "strategies": {},
+                "leaderboard": [],
+            },
+        ) as run_paper:
+            submitted = client.post(
+                "/api/paper/run-job",
+                json={
+                    "deployment_config": inline_config,
+                    "asof_start": "2026-04-23",
+                    "asof_end": "2026-04-24",
+                },
+            )
+            self.assertEqual(submitted.status_code, 202)
+            job_id = submitted.json()["id"]
+
+            job_payload = submitted.json()
+            for _ in range(60):
+                job = client.get(f"/api/paper/jobs/{job_id}")
+                self.assertEqual(job.status_code, 200)
+                job_payload = job.json()
+                if job_payload["status"] in {"completed", "failed"}:
+                    break
+                time.sleep(0.05)
+
+            self.assertEqual(job_payload["status"], "completed")
+            self.assertEqual(job_payload["result"]["run_sequence"]["count"], 2)
+            self.assertEqual([call.kwargs["asof_date"] for call in run_paper.call_args_list], ["2026-04-23", "2026-04-24"])
+            deployment_path = Path(job_payload["result"]["run_sequence"]["deployment_config_path"])
+            self.assertTrue(deployment_path.exists())
+            saved_config = json.loads(deployment_path.read_text(encoding="utf-8"))
+            self.assertEqual(len(saved_config["strategies"]), 2)
+            self.assertEqual(saved_config["strategies"][1]["news_provider_names"], ["local"])
+            self.assertEqual(run_paper.call_count, 2)
 
 
 if __name__ == "__main__":

@@ -21,6 +21,35 @@ Shadow paper trading solves two early problems:
   --paper-asof-date 2026-04-24
 ```
 
+## Run From The Website
+
+Open the React dashboard and go to `Live Trading`.
+
+Configure one or more fake-money agents, then click `Deploy Agents`. The page builds an inline deployment config and starts an asynchronous paper job:
+- `loading_config`: reads the deployment config and execution settings
+- `building_signals`: runs the strategies, news/sentiment overlays when configured, and builds target weights
+- `simulating_orders`: applies risk controls, costs, slippage, and fake execution
+- `saving_ledgers`: writes positions, cash, latest orders, dashboards, and API payloads
+
+The live page supports:
+- multiple agents in one deployment
+- method selection from the catalog
+- symbols, sector maps, and event files
+- timeframes and lookback bars
+- single-date execution
+- business-day date range replay
+- sentiment/news settings for news-aware pipelines
+
+Backend endpoints:
+
+```text
+POST /api/paper/run-job
+GET  /api/paper/jobs
+GET  /api/paper/jobs/{job_id}
+```
+
+This is still fake-money shadow trading. It is called `live` because it runs against the current configured as-of date and updates persistent ledgers, not because it sends real broker orders.
+
 ## What The Sample Config Does
 
 The sample config at `examples/paper_deployment.sample.json` runs:
@@ -61,7 +90,8 @@ Per strategy, the paper summary includes:
 - current `positions`
 
 The dashboard is the easiest place to inspect the money:
-- `Overview`: combined fake-money equity, leaderboard, and per-sleeve status cards
+- `Overview`: combined fake-money equity, PnL chart, exposure chart, capital allocation, leaderboard, and per-sleeve status
+- `Live Trading`: multi-agent paper deployment, execution progress, job history, method charts, sentiment coverage, symbol coverage, risk footprint, order notional, and latest orders
 - `Strategies`: current holdings, target weights, latest equity curve, and per-strategy capital
 - `Orders`: simulated buy/sell orders, notional, commission, and execution price
 - `Diagnostics`: raw model diagnostics and backend payloads
