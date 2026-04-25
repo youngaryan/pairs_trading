@@ -5,8 +5,8 @@ from typing import Callable, Sequence
 
 import pandas as pd
 
-from ..framework import StrategyOutput, WalkForwardStrategy
-from ..portfolio import PortfolioManager
+from ..core.framework import StrategyOutput, WalkForwardStrategy
+from ..core.portfolio import PortfolioManager
 
 
 StrategyFactory = Callable[[str], WalkForwardStrategy]

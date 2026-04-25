@@ -5,14 +5,14 @@ import unittest
 
 import pandas as pd
 
-from pairs_trading.news_data import (
+from pairs_trading.data.news import (
     CachedNewsSentimentProvider,
     CompositeHeadlineProvider,
     DailySentimentFileProvider,
     HeadlineProvider,
     LocalNewsFileProvider,
 )
-from pairs_trading.sentiment import BaseSentimentModel
+from pairs_trading.features.sentiment import BaseSentimentModel
 from tests.common import fresh_test_dir
 
 

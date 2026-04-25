@@ -5,10 +5,10 @@ from unittest.mock import patch
 
 import pandas as pd
 
-from pairs_trading.backtesting import CostModel, WalkForwardBacktester, WalkForwardConfig
-from pairs_trading.events_data import LocalEventFileProvider, SecCompanyFactsEventProvider
+from pairs_trading.data.events import LocalEventFileProvider, SecCompanyFactsEventProvider
+from pairs_trading.engines.backtesting import CostModel, WalkForwardBacktester, WalkForwardConfig
 from pairs_trading.pipelines import EventDrivenConfig, EventDrivenPipeline
-from pairs_trading.portfolio import PortfolioManager
+from pairs_trading.core.portfolio import PortfolioManager
 from tests.common import fresh_test_dir, synthetic_directional_prices, synthetic_event_panel
 
 

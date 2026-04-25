@@ -4,7 +4,7 @@ import unittest
 
 import pandas as pd
 
-from pairs_trading.news_data import AlphaVantageNewsProvider, BenzingaNewsProvider
+from pairs_trading.data.news import AlphaVantageNewsProvider, BenzingaNewsProvider
 
 
 class StubAlphaVantageProvider(AlphaVantageNewsProvider):

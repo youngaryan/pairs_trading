@@ -55,6 +55,11 @@ class MarketDataProvider(ABC):
 class YahooFinanceProvider(MarketDataProvider):
     """Remote provider kept behind an interface so the rest of the code stays provider-agnostic."""
 
+    def __init__(self, tz_cache_dir: str | Path = "data/yfinance_tz_cache") -> None:
+        self.tz_cache_dir = Path(tz_cache_dir)
+        self.tz_cache_dir.mkdir(parents=True, exist_ok=True)
+        yf.set_tz_cache_location(str(self.tz_cache_dir))
+
     def get_close_prices(
         self,
         symbols: Sequence[str],
@@ -113,6 +118,49 @@ class CachedParquetProvider(MarketDataProvider):
         meta_path = interval_dir / f"{request.cache_key}.json"
         return parquet_path, meta_path
 
+    def _find_compatible_cache(self, request: DataRequest) -> pd.DataFrame | None:
+        interval_dir = self.cache_dir / request.interval
+        if not interval_dir.exists():
+            return None
+
+        request_start = pd.Timestamp(request.start)
+        request_end = pd.Timestamp(request.end)
+        requested_symbols = list(request.symbols)
+        requested_symbol_set = set(requested_symbols)
+
+        for meta_path in interval_dir.glob("*.json"):
+            try:
+                payload = json.loads(meta_path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+
+            cached_symbols = [str(symbol) for symbol in payload.get("symbols", [])]
+            if not requested_symbol_set.issubset(set(cached_symbols)):
+                continue
+
+            cached_start = pd.Timestamp(payload.get("start"))
+            cached_end = pd.Timestamp(payload.get("end"))
+            if cached_start > request_start or cached_end < request_end:
+                continue
+
+            parquet_path = meta_path.with_suffix(".parquet")
+            if not parquet_path.exists():
+                continue
+
+            cached = pd.read_parquet(parquet_path)
+            missing_symbols = [symbol for symbol in requested_symbols if symbol not in cached.columns]
+            if missing_symbols:
+                continue
+
+            cached = cached.loc[:, requested_symbols].sort_index()
+            cached.index = pd.DatetimeIndex(cached.index).tz_localize(None)
+            sliced = cached.loc[(cached.index >= request_start) & (cached.index < request_end)]
+            if sliced.empty:
+                continue
+            return sliced
+
+        return None
+
     def get_close_prices(
         self,
         symbols: Sequence[str],
@@ -128,6 +176,10 @@ class CachedParquetProvider(MarketDataProvider):
             cached = cached.loc[:, list(request.symbols)].sort_index()
             cached.index = pd.DatetimeIndex(cached.index).tz_localize(None)
             return cached
+
+        compatible = self._find_compatible_cache(request)
+        if compatible is not None:
+            return compatible
 
         if self.upstream is None:
             raise FileNotFoundError(f"Missing cache entry {parquet_path} and no upstream provider is configured.")

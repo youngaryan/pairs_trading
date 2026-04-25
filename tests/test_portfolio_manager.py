@@ -4,7 +4,7 @@ import unittest
 
 import pandas as pd
 
-from pairs_trading.portfolio import PortfolioManager
+from pairs_trading.core.portfolio import PortfolioManager
 from pairs_trading.strategies import StrategyOutput
 
 

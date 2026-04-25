@@ -5,10 +5,10 @@ from typing import Any, Mapping
 
 import pandas as pd
 
-from ..framework import StrategyOutput, WalkForwardStrategy
-from ..portfolio import PortfolioManager
+from ..core.framework import StrategyOutput, WalkForwardStrategy
+from ..core.portfolio import PortfolioManager
 from ..research import PairScreenConfig, rank_sector_pairs
-from ..sentiment import (
+from ..features.sentiment import (
     SentimentConfig,
     adjust_pair_rankings_with_sentiment,
     apply_sentiment_overlay,
@@ -96,7 +96,11 @@ class SectorStatArbPipeline(WalkForwardStrategy):
             diagnostics={"status": reason, "selected_pairs": []},
         ).validate(extra_columns=("unit_return", "gross_return"))
 
-    def run_fold(self, train_data: pd.DataFrame, test_data: pd.DataFrame) -> StrategyOutput:
+    def build_component_outputs(
+        self,
+        train_data: pd.DataFrame,
+        test_data: pd.DataFrame,
+    ) -> tuple[dict[str, StrategyOutput], pd.DataFrame, list[dict[str, Any]], list[str]]:
         pair_outputs: dict[str, StrategyOutput] = {}
 
         residual_symbols: list[str] = []
@@ -176,6 +180,14 @@ class SectorStatArbPipeline(WalkForwardStrategy):
                         sentiment_overlay=overlay,
                         config=self.sentiment_config,
                     )
+
+        return pair_outputs, ranked_pairs, selected_pairs, residual_symbols
+
+    def run_fold(self, train_data: pd.DataFrame, test_data: pd.DataFrame) -> StrategyOutput:
+        pair_outputs, ranked_pairs, selected_pairs, residual_symbols = self.build_component_outputs(
+            train_data=train_data,
+            test_data=test_data,
+        )
 
         if not pair_outputs:
             return self._flat_output(index=test_data.index, reason="no_tradeable_stat_arb_components")

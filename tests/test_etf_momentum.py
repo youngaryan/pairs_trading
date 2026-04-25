@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from pairs_trading.backtesting import CostModel, WalkForwardBacktester, WalkForwardConfig
+from pairs_trading.engines.backtesting import CostModel, WalkForwardBacktester, WalkForwardConfig
 from pairs_trading.pipelines import ETFMomentumConfig, ETFTrendMomentumPipeline
 from tests.common import fresh_test_dir, synthetic_etf_prices
 

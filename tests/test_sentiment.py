@@ -5,7 +5,7 @@ import unittest
 import numpy as np
 import pandas as pd
 
-from pairs_trading.sentiment import (
+from pairs_trading.features.sentiment import (
     BaseSentimentModel,
     FinBERTSentimentModel,
     NewsSentimentAggregator,

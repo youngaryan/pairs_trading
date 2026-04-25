@@ -4,10 +4,10 @@ import unittest
 
 import pandas as pd
 
-from pairs_trading.broker import BrokerConfig, SimulatedBroker
-from pairs_trading.execution import ExecutionConfig
-from pairs_trading.framework import StrategyOutput
-from pairs_trading.risk import RiskConfig
+from pairs_trading.core.framework import StrategyOutput
+from pairs_trading.engines.broker import BrokerConfig, SimulatedBroker
+from pairs_trading.engines.execution import ExecutionConfig
+from pairs_trading.engines.risk import RiskConfig
 
 
 class BrokerStackTests(unittest.TestCase):

@@ -5,6 +5,8 @@ This guide shows how to run the three main sleeves in a consistent research proc
 - `Sector-neutral residual stat-arb`
 - `EDGAR event drift`
 
+It also supports single-asset directional strategy research. Those strategies are useful for education, feature testing, and building blocks, but they should be promoted slowly through the same validation process as the main sleeves.
+
 ## 1. Verify The Environment
 
 Run the test suite first:
@@ -21,7 +23,7 @@ Check the CLI:
 
 ## 2. Prepare Data
 
-Price data is loaded through `pairs_trading/market_data.py`.
+Price data is loaded through `pairs_trading/data/market.py`.
 
 By default the CLI uses:
 - `CachedParquetProvider`
@@ -162,7 +164,39 @@ There are two ways to do this.
 
 The SEC path builds event scores from company facts growth data and caches them under `data/event_cache/`.
 
-## 6. Read The Validation Outputs
+## 6. Run Directional Strategy Labs
+
+The directional lab now includes thirteen strategies from basic to advanced:
+- `buy_and_hold`: passive long-only benchmark.
+- `ma_cross`: simple moving-average trend.
+- `ema_cross`: faster exponential moving-average trend.
+- `rsi_mean_reversion`: oscillator-based overbought/oversold mean reversion.
+- `sma_deviation`: z-score deviation from a moving average.
+- `stochastic_oscillator`: channel-location oscillator mean reversion.
+- `bollinger_mean_reversion`: volatility-band mean reversion.
+- `macd_trend`: MACD histogram trend continuation.
+- `donchian_breakout`: prior high/low breakout.
+- `keltner_breakout`: volatility-adjusted channel breakout.
+- `volatility_target_trend`: trend following with realized-volatility scaling.
+- `time_series_momentum`: multi-horizon momentum vote.
+- `adaptive_regime`: trend in stronger regimes, mean reversion in calmer regimes.
+
+Example advanced lab:
+
+```powershell
+.\.venv\Scripts\python.exe -m pairs_trading `
+  --pipeline time_series_momentum `
+  --symbols SPY QQQ TLT GLD `
+  --momentum-lookbacks 21 63 126 252 `
+  --momentum-min-agreement 0.25 `
+  --start 2010-01-01 `
+  --end 2026-04-15 `
+  --experiment-name tsmom_macro_lab
+```
+
+Use the web dashboard `Catalog` page or [strategy_catalog.md](strategy_catalog.md) for full explanations and parameter examples.
+
+## 7. Read The Validation Outputs
 
 Each sleeve now reports:
 - `psr`
@@ -175,13 +209,13 @@ Rules of thumb:
 - review `avg_turnover` together with `net_return`
 - drawdown and turnover matter as much as raw CAGR
 
-## 7. Inspect Execution And Risk Assumptions
+## 8. Inspect Execution And Risk Assumptions
 
 The broker simulation now separates:
-- `risk.py`: leverage and turnover constraints
-- `execution.py`: commission, spread, slippage, impact, funding, borrow, and delay assumptions
-- `broker.py`: orchestration of risk and execution
-- `reconciliation.py`: post-run execution summaries
+- `pairs_trading/engines/risk.py`: leverage and turnover constraints
+- `pairs_trading/engines/execution.py`: commission, spread, slippage, impact, funding, borrow, and delay assumptions
+- `pairs_trading/engines/broker.py`: orchestration of risk and execution
+- `pairs_trading/engines/reconciliation.py`: post-run execution summaries
 
 Columns worth checking in `equity_curve.parquet`:
 - `execution_cost`
@@ -193,7 +227,7 @@ Columns worth checking in `equity_curve.parquet`:
 - `risk_scale`
 - `participation_rate`
 
-## 8. Compare Sleeves
+## 9. Compare Sleeves
 
 After running the three main sleeves, compare:
 - return quality: `dsr`, `pbo`, `max_drawdown`
@@ -205,7 +239,7 @@ Recommended order for serious capital:
 2. `stat_arb`
 3. `edgar_event`
 
-## 9. Next Iteration Checklist
+## 10. Next Iteration Checklist
 
 Before putting more capital behind any sleeve:
 - replace the default price provider with a production vendor

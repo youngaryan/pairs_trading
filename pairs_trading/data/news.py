@@ -12,7 +12,7 @@ from typing import Sequence
 
 import pandas as pd
 
-from .sentiment import BaseSentimentModel, NewsSentimentAggregator
+from ..features.sentiment import BaseSentimentModel, NewsSentimentAggregator
 
 
 @dataclass(frozen=True)

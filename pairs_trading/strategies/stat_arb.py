@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 import statsmodels.api as sm
 
-from ..framework import StrategyOutput, WalkForwardStrategy
+from ..core.framework import StrategyOutput, WalkForwardStrategy
 
 
 class SectorResidualMeanReversionStrategy(WalkForwardStrategy):

@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .execution import ExecutionConfig, ExecutionEngine
-from .framework import StrategyOutput
+from ..core.framework import StrategyOutput
 from .reconciliation import ReconciliationEngine
 from .risk import RiskConfig, RiskManager
 

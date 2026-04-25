@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import unittest
 
-from pairs_trading.backtesting import CostModel, WalkForwardBacktester, WalkForwardConfig
+from pairs_trading.engines.backtesting import CostModel, WalkForwardBacktester, WalkForwardConfig
 from pairs_trading.pipelines import SectorStatArbPipeline, StatArbConfig
-from pairs_trading.portfolio import PortfolioManager
+from pairs_trading.core.portfolio import PortfolioManager
 from pairs_trading.research import PairScreenConfig, rank_sector_pairs
-from pairs_trading.sentiment import SentimentConfig
+from pairs_trading.features.sentiment import SentimentConfig
 from tests.common import fresh_test_dir, synthetic_daily_sentiment, synthetic_prices_and_sector_map
 
 

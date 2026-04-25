@@ -19,6 +19,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+backend = [
+  "fastapi>=0.115",
+  "httpx>=0.27",
+  "uvicorn[standard]>=0.34",
+]
 sentiment = [
   "huggingface_hub>=0.22",
   "torch>=2.2",
@@ -26,7 +31,10 @@ sentiment = [
 ]
 
 [project.scripts]
-pairs-trading = "pairs_trading.cli:main"
+pairs-trading = "pairs_trading.apps.cli:main"
+
+[tool.fastapi]
+entrypoint = "pairs_trading.backend.app:app"
 
 [tool.setuptools.packages.find]
 where = ["."]

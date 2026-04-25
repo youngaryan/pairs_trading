@@ -8,19 +8,10 @@ from typing import Any, Callable, Mapping
 
 import pandas as pd
 
-from .backtesting import (
-    CostModel,
-    ExperimentResult,
-    WalkForwardBacktester,
-    WalkForwardConfig,
-    json_ready,
-    run_trial_grid,
-)
-from .broker import BrokerConfig, SimulatedBroker
-from .events_data import CachedEventProvider, LocalEventFileProvider, SecCompanyFactsEventProvider
-from .execution import ExecutionConfig
-from .market_data import CachedParquetProvider, YahooFinanceProvider
-from .news_data import (
+from ..core.portfolio import PortfolioManager
+from ..data.events import CachedEventProvider, LocalEventFileProvider, SecCompanyFactsEventProvider
+from ..data.market import CachedParquetProvider, YahooFinanceProvider
+from ..data.news import (
     AlphaVantageNewsProvider,
     BenzingaNewsProvider,
     CachedNewsSentimentProvider,
@@ -28,7 +19,19 @@ from .news_data import (
     DailySentimentFileProvider,
     LocalNewsFileProvider,
 )
-from .pipelines import (
+from ..engines.backtesting import (
+    CostModel,
+    ExperimentResult,
+    WalkForwardBacktester,
+    WalkForwardConfig,
+    json_ready,
+    run_trial_grid,
+)
+from ..engines.broker import BrokerConfig, SimulatedBroker
+from ..engines.execution import ExecutionConfig
+from ..engines.risk import RiskConfig
+from ..engines.validation import ValidationConfig
+from ..pipelines import (
     DirectionalPipelineConfig,
     DirectionalStrategyPipeline,
     ETFMomentumConfig,
@@ -38,13 +41,24 @@ from .pipelines import (
     SectorStatArbPipeline,
     StatArbConfig,
 )
-from .portfolio import PortfolioManager
-from .research import PairScreenConfig
-from .risk import RiskConfig
-from .sentiment import FinBERTSentimentModel, SentimentConfig, build_best_available_sentiment_model
-from .strategies import DonchianBreakoutStrategy, MovingAverageCrossStrategy, RSIMeanReversionStrategy
-from .validation import ValidationConfig
-from .visualization import ExperimentVisualizer
+from ..reporting.experiment import ExperimentVisualizer
+from ..research import PairScreenConfig
+from ..features.sentiment import FinBERTSentimentModel, SentimentConfig, build_best_available_sentiment_model
+from ..strategies import (
+    AdaptiveRegimeStrategy,
+    BollingerBandMeanReversionStrategy,
+    BuyAndHoldStrategy,
+    DonchianBreakoutStrategy,
+    EMACrossStrategy,
+    KeltnerChannelBreakoutStrategy,
+    MACDTrendStrategy,
+    MovingAverageCrossStrategy,
+    PriceSMADeviationStrategy,
+    RSIMeanReversionStrategy,
+    StochasticOscillatorStrategy,
+    TimeSeriesMomentumStrategy,
+    VolatilityTargetTrendStrategy,
+)
 
 
 DEFAULT_SECTOR_MAP = {
@@ -84,6 +98,22 @@ DEFAULT_EVENT_SYMBOLS = [
     "META",
     "JPM",
     "XOM",
+]
+
+DIRECTIONAL_PIPELINES = [
+    "buy_and_hold",
+    "ma_cross",
+    "ema_cross",
+    "rsi_mean_reversion",
+    "sma_deviation",
+    "stochastic_oscillator",
+    "bollinger_mean_reversion",
+    "macd_trend",
+    "donchian_breakout",
+    "keltner_breakout",
+    "volatility_target_trend",
+    "time_series_momentum",
+    "adaptive_regime",
 ]
 
 
@@ -196,16 +226,51 @@ def load_events(
 def _build_directional_strategy_factory(
     strategy_name: str,
     *,
-    fast_window: int,
-    slow_window: int,
-    rsi_window: int,
-    lower_entry: float,
-    upper_entry: float,
-    exit_level: float,
-    breakout_window: int,
-    breakout_exit_window: int,
-    strategy_cost_bps: float,
+    fast_window: int = 20,
+    slow_window: int = 80,
+    ema_fast_window: int = 12,
+    ema_slow_window: int = 48,
+    rsi_window: int = 14,
+    lower_entry: float = 30.0,
+    upper_entry: float = 70.0,
+    exit_level: float = 50.0,
+    sma_window: int = 40,
+    z_entry: float = 1.25,
+    z_exit: float = 0.25,
+    stochastic_window: int = 14,
+    stochastic_smooth_window: int = 3,
+    stochastic_lower_entry: float = 20.0,
+    stochastic_upper_entry: float = 80.0,
+    bollinger_window: int = 20,
+    bollinger_num_std: float = 2.0,
+    macd_fast_window: int = 12,
+    macd_slow_window: int = 26,
+    macd_signal_window: int = 9,
+    breakout_window: int = 55,
+    breakout_exit_window: int = 20,
+    keltner_window: int = 40,
+    keltner_atr_multiplier: float = 1.5,
+    trend_window: int = 120,
+    volatility_window: int = 20,
+    target_volatility: float = 0.15,
+    max_position: float = 1.5,
+    momentum_lookbacks: list[int] | tuple[int, ...] | None = None,
+    momentum_min_agreement: float = 0.25,
+    regime_fast_window: int = 30,
+    regime_slow_window: int = 120,
+    regime_mean_reversion_window: int = 40,
+    regime_volatility_window: int = 30,
+    regime_volatility_quantile: float = 0.70,
+    strategy_cost_bps: float = 2.0,
 ) -> tuple[Callable[[str], object], int]:
+    if strategy_name == "buy_and_hold":
+        return (
+            lambda symbol: BuyAndHoldStrategy(
+                symbol=symbol,
+                transaction_cost_bps=strategy_cost_bps,
+            ),
+            20,
+        )
     if strategy_name == "ma_cross":
         return (
             lambda symbol: MovingAverageCrossStrategy(
@@ -215,6 +280,16 @@ def _build_directional_strategy_factory(
                 transaction_cost_bps=strategy_cost_bps,
             ),
             max(120, slow_window + 20),
+        )
+    if strategy_name == "ema_cross":
+        return (
+            lambda symbol: EMACrossStrategy(
+                symbol=symbol,
+                fast_window=ema_fast_window,
+                slow_window=ema_slow_window,
+                transaction_cost_bps=strategy_cost_bps,
+            ),
+            max(100, ema_slow_window + 20),
         )
     if strategy_name == "rsi_mean_reversion":
         return (
@@ -228,6 +303,52 @@ def _build_directional_strategy_factory(
             ),
             max(80, rsi_window * 4),
         )
+    if strategy_name == "sma_deviation":
+        return (
+            lambda symbol: PriceSMADeviationStrategy(
+                symbol=symbol,
+                window=sma_window,
+                entry_z=z_entry,
+                exit_z=z_exit,
+                transaction_cost_bps=strategy_cost_bps,
+            ),
+            max(120, sma_window * 3),
+        )
+    if strategy_name == "stochastic_oscillator":
+        return (
+            lambda symbol: StochasticOscillatorStrategy(
+                symbol=symbol,
+                window=stochastic_window,
+                smooth_window=stochastic_smooth_window,
+                lower_entry=stochastic_lower_entry,
+                upper_entry=stochastic_upper_entry,
+                exit_level=exit_level,
+                transaction_cost_bps=strategy_cost_bps,
+            ),
+            max(100, stochastic_window * 5),
+        )
+    if strategy_name == "bollinger_mean_reversion":
+        return (
+            lambda symbol: BollingerBandMeanReversionStrategy(
+                symbol=symbol,
+                window=bollinger_window,
+                num_std=bollinger_num_std,
+                exit_z=z_exit,
+                transaction_cost_bps=strategy_cost_bps,
+            ),
+            max(120, bollinger_window * 5),
+        )
+    if strategy_name == "macd_trend":
+        return (
+            lambda symbol: MACDTrendStrategy(
+                symbol=symbol,
+                fast_window=macd_fast_window,
+                slow_window=macd_slow_window,
+                signal_window=macd_signal_window,
+                transaction_cost_bps=strategy_cost_bps,
+            ),
+            max(120, macd_slow_window * 5),
+        )
     if strategy_name == "donchian_breakout":
         return (
             lambda symbol: DonchianBreakoutStrategy(
@@ -237,6 +358,53 @@ def _build_directional_strategy_factory(
                 transaction_cost_bps=strategy_cost_bps,
             ),
             max(120, breakout_window + breakout_exit_window + 20),
+        )
+    if strategy_name == "keltner_breakout":
+        return (
+            lambda symbol: KeltnerChannelBreakoutStrategy(
+                symbol=symbol,
+                window=keltner_window,
+                atr_multiplier=keltner_atr_multiplier,
+                transaction_cost_bps=strategy_cost_bps,
+            ),
+            max(140, keltner_window * 4),
+        )
+    if strategy_name == "volatility_target_trend":
+        return (
+            lambda symbol: VolatilityTargetTrendStrategy(
+                symbol=symbol,
+                trend_window=trend_window,
+                volatility_window=volatility_window,
+                target_volatility=target_volatility,
+                max_position=max_position,
+                transaction_cost_bps=strategy_cost_bps,
+            ),
+            max(180, trend_window + volatility_window + 20),
+        )
+    if strategy_name == "time_series_momentum":
+        lookbacks = tuple(momentum_lookbacks or (21, 63, 126, 252))
+        return (
+            lambda symbol: TimeSeriesMomentumStrategy(
+                symbol=symbol,
+                lookbacks=lookbacks,
+                min_agreement=momentum_min_agreement,
+                transaction_cost_bps=strategy_cost_bps,
+            ),
+            max(300, max(lookbacks) + 40),
+        )
+    if strategy_name == "adaptive_regime":
+        return (
+            lambda symbol: AdaptiveRegimeStrategy(
+                symbol=symbol,
+                fast_window=regime_fast_window,
+                slow_window=regime_slow_window,
+                mean_reversion_window=regime_mean_reversion_window,
+                volatility_window=regime_volatility_window,
+                volatility_quantile=regime_volatility_quantile,
+                entry_z=z_entry,
+                transaction_cost_bps=strategy_cost_bps,
+            ),
+            max(240, regime_slow_window + regime_mean_reversion_window + regime_volatility_window),
         )
     raise ValueError(f"Unsupported directional strategy: {strategy_name}")
 
@@ -578,12 +746,39 @@ def run_directional_pipeline(
     bars_per_year: int = 252,
     fast_window: int = 20,
     slow_window: int = 80,
+    ema_fast_window: int = 12,
+    ema_slow_window: int = 48,
     rsi_window: int = 14,
     lower_entry: float = 30.0,
     upper_entry: float = 70.0,
     exit_level: float = 50.0,
+    sma_window: int = 40,
+    z_entry: float = 1.25,
+    z_exit: float = 0.25,
+    stochastic_window: int = 14,
+    stochastic_smooth_window: int = 3,
+    stochastic_lower_entry: float = 20.0,
+    stochastic_upper_entry: float = 80.0,
+    bollinger_window: int = 20,
+    bollinger_num_std: float = 2.0,
+    macd_fast_window: int = 12,
+    macd_slow_window: int = 26,
+    macd_signal_window: int = 9,
     breakout_window: int = 55,
     breakout_exit_window: int = 20,
+    keltner_window: int = 40,
+    keltner_atr_multiplier: float = 1.5,
+    trend_window: int = 120,
+    volatility_window: int = 20,
+    target_volatility: float = 0.15,
+    max_position: float = 1.5,
+    momentum_lookbacks: list[int] | tuple[int, ...] | None = None,
+    momentum_min_agreement: float = 0.25,
+    regime_fast_window: int = 30,
+    regime_slow_window: int = 120,
+    regime_mean_reversion_window: int = 40,
+    regime_volatility_window: int = 30,
+    regime_volatility_quantile: float = 0.70,
     strategy_cost_bps: float = 2.0,
     purge_bars: int = 5,
     embargo_bars: int = 0,
@@ -596,12 +791,39 @@ def run_directional_pipeline(
         strategy_name,
         fast_window=fast_window,
         slow_window=slow_window,
+        ema_fast_window=ema_fast_window,
+        ema_slow_window=ema_slow_window,
         rsi_window=rsi_window,
         lower_entry=lower_entry,
         upper_entry=upper_entry,
         exit_level=exit_level,
+        sma_window=sma_window,
+        z_entry=z_entry,
+        z_exit=z_exit,
+        stochastic_window=stochastic_window,
+        stochastic_smooth_window=stochastic_smooth_window,
+        stochastic_lower_entry=stochastic_lower_entry,
+        stochastic_upper_entry=stochastic_upper_entry,
+        bollinger_window=bollinger_window,
+        bollinger_num_std=bollinger_num_std,
+        macd_fast_window=macd_fast_window,
+        macd_slow_window=macd_slow_window,
+        macd_signal_window=macd_signal_window,
         breakout_window=breakout_window,
         breakout_exit_window=breakout_exit_window,
+        keltner_window=keltner_window,
+        keltner_atr_multiplier=keltner_atr_multiplier,
+        trend_window=trend_window,
+        volatility_window=volatility_window,
+        target_volatility=target_volatility,
+        max_position=max_position,
+        momentum_lookbacks=momentum_lookbacks,
+        momentum_min_agreement=momentum_min_agreement,
+        regime_fast_window=regime_fast_window,
+        regime_slow_window=regime_slow_window,
+        regime_mean_reversion_window=regime_mean_reversion_window,
+        regime_volatility_window=regime_volatility_window,
+        regime_volatility_quantile=regime_volatility_quantile,
         strategy_cost_bps=strategy_cost_bps,
     )
 
@@ -829,16 +1051,13 @@ def run_event_driven_pipeline(
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run the quant walk-forward research pipeline.")
     parser.add_argument(
+        "--deploy-paper-config",
+        help="JSON config for multi-strategy shadow paper trading deployment. When provided, runs paper mode instead of backtests.",
+    )
+    parser.add_argument(
         "--pipeline",
         default="stat_arb",
-        choices=[
-            "stat_arb",
-            "etf_trend",
-            "edgar_event",
-            "ma_cross",
-            "rsi_mean_reversion",
-            "donchian_breakout",
-        ],
+        choices=["stat_arb", "etf_trend", "edgar_event", *DIRECTIONAL_PIPELINES],
         help="Research pipeline to run.",
     )
     parser.add_argument("--symbols", nargs="*", help="Symbols for directional, ETF, or event pipelines.")
@@ -875,14 +1094,44 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--price-cache-dir", default="data/cache", help="Price parquet cache directory.")
     parser.add_argument("--sentiment-cache-dir", default="data/sentiment_cache", help="Sentiment cache directory.")
     parser.add_argument("--event-cache-dir", default="data/event_cache", help="Event cache directory.")
+    parser.add_argument("--paper-state-dir", default="artifacts/paper/state", help="State directory for shadow paper ledgers.")
+    parser.add_argument("--paper-artifact-root", default="artifacts/paper/runs", help="Artifact directory for shadow paper runs.")
+    parser.add_argument("--paper-asof-date", help="As-of date for a paper deployment run. Defaults to today in UTC.")
     parser.add_argument("--fast-window", type=int, default=20, help="Fast MA window for ma_cross.")
     parser.add_argument("--slow-window", type=int, default=80, help="Slow MA window for ma_cross.")
+    parser.add_argument("--ema-fast-window", type=int, default=12, help="Fast EMA window for ema_cross.")
+    parser.add_argument("--ema-slow-window", type=int, default=48, help="Slow EMA window for ema_cross.")
     parser.add_argument("--rsi-window", type=int, default=14, help="RSI window for rsi_mean_reversion.")
     parser.add_argument("--lower-entry", type=float, default=30.0, help="Long entry RSI threshold.")
     parser.add_argument("--upper-entry", type=float, default=70.0, help="Short entry RSI threshold.")
     parser.add_argument("--exit-level", type=float, default=50.0, help="RSI exit level.")
+    parser.add_argument("--sma-window", type=int, default=40, help="SMA window for sma_deviation.")
+    parser.add_argument("--z-entry", type=float, default=1.25, help="Z-score entry threshold for mean-reversion strategies.")
+    parser.add_argument("--z-exit", type=float, default=0.25, help="Z-score exit threshold for mean-reversion strategies.")
+    parser.add_argument("--stochastic-window", type=int, default=14, help="Lookback for stochastic_oscillator.")
+    parser.add_argument("--stochastic-smooth-window", type=int, default=3, help="Smoothing window for stochastic_oscillator.")
+    parser.add_argument("--stochastic-lower-entry", type=float, default=20.0, help="Long entry threshold for stochastic_oscillator.")
+    parser.add_argument("--stochastic-upper-entry", type=float, default=80.0, help="Short entry threshold for stochastic_oscillator.")
+    parser.add_argument("--bollinger-window", type=int, default=20, help="Rolling window for bollinger_mean_reversion.")
+    parser.add_argument("--bollinger-num-std", type=float, default=2.0, help="Band width for bollinger_mean_reversion.")
+    parser.add_argument("--macd-fast-window", type=int, default=12, help="Fast EMA window for macd_trend.")
+    parser.add_argument("--macd-slow-window", type=int, default=26, help="Slow EMA window for macd_trend.")
+    parser.add_argument("--macd-signal-window", type=int, default=9, help="Signal EMA window for macd_trend.")
     parser.add_argument("--breakout-window", type=int, default=55, help="Lookback for Donchian breakouts.")
     parser.add_argument("--breakout-exit-window", type=int, default=20, help="Exit lookback for Donchian breakouts.")
+    parser.add_argument("--keltner-window", type=int, default=40, help="EMA/ATR window for keltner_breakout.")
+    parser.add_argument("--keltner-atr-multiplier", type=float, default=1.5, help="ATR channel width for keltner_breakout.")
+    parser.add_argument("--trend-window", type=int, default=120, help="Trend window for volatility_target_trend.")
+    parser.add_argument("--volatility-window", type=int, default=20, help="Volatility window for volatility-aware directional strategies.")
+    parser.add_argument("--target-volatility", type=float, default=0.15, help="Annualized target volatility for volatility_target_trend.")
+    parser.add_argument("--max-position", type=float, default=1.5, help="Maximum single-strategy position multiplier.")
+    parser.add_argument("--momentum-lookbacks", nargs="*", type=int, help="Lookbacks for time_series_momentum.")
+    parser.add_argument("--momentum-min-agreement", type=float, default=0.25, help="Minimum horizon agreement for time_series_momentum.")
+    parser.add_argument("--regime-fast-window", type=int, default=30, help="Fast MA window for adaptive_regime.")
+    parser.add_argument("--regime-slow-window", type=int, default=120, help="Slow MA window for adaptive_regime.")
+    parser.add_argument("--regime-mean-reversion-window", type=int, default=40, help="Mean-reversion window for adaptive_regime.")
+    parser.add_argument("--regime-volatility-window", type=int, default=30, help="Volatility window for adaptive_regime.")
+    parser.add_argument("--regime-volatility-quantile", type=float, default=0.70, help="Volatility quantile used by adaptive_regime.")
     parser.add_argument("--strategy-cost-bps", type=float, default=2.0, help="Internal strategy turnover cost in bps.")
     return parser
 
@@ -890,6 +1139,23 @@ def _build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     parser = _build_parser()
     args = parser.parse_args()
+
+    if args.deploy_paper_config:
+        from ..operations.paper_trading import run_paper_batch
+
+        paper_output = run_paper_batch(
+            deployment_config_path=args.deploy_paper_config,
+            asof_date=args.paper_asof_date,
+            state_dir=args.paper_state_dir,
+            artifact_root=args.paper_artifact_root,
+            price_cache_dir=args.price_cache_dir,
+            sentiment_cache_dir=args.sentiment_cache_dir,
+            event_cache_dir=args.event_cache_dir,
+        )
+        print(json.dumps(json_ready(paper_output), indent=2))
+        print(f"Paper artifacts saved to: {paper_output['artifact_dir']}")
+        return
+
     experiment_name = args.experiment_name or args.pipeline
 
     if args.pipeline == "stat_arb":
@@ -963,12 +1229,39 @@ def main() -> None:
             bars_per_year=args.bars_per_year,
             fast_window=args.fast_window,
             slow_window=args.slow_window,
+            ema_fast_window=args.ema_fast_window,
+            ema_slow_window=args.ema_slow_window,
             rsi_window=args.rsi_window,
             lower_entry=args.lower_entry,
             upper_entry=args.upper_entry,
             exit_level=args.exit_level,
+            sma_window=args.sma_window,
+            z_entry=args.z_entry,
+            z_exit=args.z_exit,
+            stochastic_window=args.stochastic_window,
+            stochastic_smooth_window=args.stochastic_smooth_window,
+            stochastic_lower_entry=args.stochastic_lower_entry,
+            stochastic_upper_entry=args.stochastic_upper_entry,
+            bollinger_window=args.bollinger_window,
+            bollinger_num_std=args.bollinger_num_std,
+            macd_fast_window=args.macd_fast_window,
+            macd_slow_window=args.macd_slow_window,
+            macd_signal_window=args.macd_signal_window,
             breakout_window=args.breakout_window,
             breakout_exit_window=args.breakout_exit_window,
+            keltner_window=args.keltner_window,
+            keltner_atr_multiplier=args.keltner_atr_multiplier,
+            trend_window=args.trend_window,
+            volatility_window=args.volatility_window,
+            target_volatility=args.target_volatility,
+            max_position=args.max_position,
+            momentum_lookbacks=args.momentum_lookbacks,
+            momentum_min_agreement=args.momentum_min_agreement,
+            regime_fast_window=args.regime_fast_window,
+            regime_slow_window=args.regime_slow_window,
+            regime_mean_reversion_window=args.regime_mean_reversion_window,
+            regime_volatility_window=args.regime_volatility_window,
+            regime_volatility_quantile=args.regime_volatility_quantile,
             strategy_cost_bps=args.strategy_cost_bps,
             purge_bars=args.validation_purge_bars,
             embargo_bars=args.validation_embargo_bars,

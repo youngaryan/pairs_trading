@@ -7,7 +7,7 @@ import pandas as pd
 import statsmodels.api as sm
 from statsmodels.tsa.stattools import coint
 
-from ..framework import StrategyOutput, WalkForwardStrategy, estimate_half_life, rolling_adf_pvalue
+from ..core.framework import StrategyOutput, WalkForwardStrategy, estimate_half_life, rolling_adf_pvalue
 
 
 class KalmanPairsStrategy(WalkForwardStrategy):

@@ -5,7 +5,7 @@ import unittest
 import numpy as np
 import pandas as pd
 
-from pairs_trading.validation import (
+from pairs_trading.engines.validation import (
     build_validation_report,
     build_walk_forward_boundaries,
     probability_of_backtest_overfitting,

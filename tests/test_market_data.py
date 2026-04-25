@@ -5,7 +5,7 @@ import unittest
 
 import pandas as pd
 
-from pairs_trading.market_data import CachedParquetProvider, MarketDataProvider
+from pairs_trading.data.market import CachedParquetProvider, MarketDataProvider
 from tests.common import fresh_test_dir
 
 
@@ -36,6 +36,23 @@ class MarketDataCacheTests(unittest.TestCase):
 
         self.assertEqual(upstream.calls, 1)
         pd.testing.assert_frame_equal(first, second, check_freq=False)
+
+    def test_cached_parquet_provider_reuses_wider_cached_range(self) -> None:
+        index = pd.date_range("2024-01-01", periods=5, freq="D")
+        data = pd.DataFrame({"AAA": [1.0, 1.1, 1.2, 1.3, 1.4], "BBB": [2.0, 2.1, 2.2, 2.3, 2.4]}, index=index)
+        upstream = DummyProvider(data=data)
+        cache_dir = fresh_test_dir("artifacts/test_cache/market_data_subset")
+
+        provider = CachedParquetProvider(upstream=upstream, cache_dir=cache_dir)
+        provider.get_close_prices(["AAA", "BBB"], "2024-01-01", "2024-01-06")
+        self.assertEqual(upstream.calls, 1)
+
+        upstream.data = pd.DataFrame({"AAA": [9.0] * 5, "BBB": [9.0] * 5}, index=index)
+        subset = provider.get_close_prices(["AAA"], "2024-01-02", "2024-01-05")
+
+        self.assertEqual(upstream.calls, 1)
+        expected = data.loc[(data.index >= pd.Timestamp("2024-01-02")) & (data.index < pd.Timestamp("2024-01-05")), ["AAA"]]
+        pd.testing.assert_frame_equal(subset, expected, check_freq=False)
 
 
 if __name__ == "__main__":

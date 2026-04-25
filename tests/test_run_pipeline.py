@@ -6,8 +6,8 @@ from unittest.mock import patch
 
 import pandas as pd
 
-from pairs_trading.cli import load_daily_sentiment, load_sector_map, run_directional_pipeline, run_stat_arb_pipeline
-from pairs_trading.sentiment import RuleBasedFinancialSentimentModel
+from pairs_trading.apps.cli import load_daily_sentiment, load_sector_map, run_directional_pipeline, run_stat_arb_pipeline
+from pairs_trading.features.sentiment import RuleBasedFinancialSentimentModel
 from tests.common import fresh_test_dir, synthetic_directional_prices, synthetic_prices_and_sector_map
 
 
@@ -99,8 +99,8 @@ class RunPipelineHelperTests(unittest.TestCase):
             }
         ).to_csv(news_path_two, index=False)
 
-        with patch("pairs_trading.cli.CachedParquetProvider.get_close_prices", return_value=prices), patch(
-            "pairs_trading.cli.build_best_available_sentiment_model",
+        with patch("pairs_trading.apps.cli.CachedParquetProvider.get_close_prices", return_value=prices), patch(
+            "pairs_trading.apps.cli.build_best_available_sentiment_model",
             return_value=RuleBasedFinancialSentimentModel(),
         ):
             output = run_stat_arb_pipeline(
@@ -122,7 +122,7 @@ class RunPipelineHelperTests(unittest.TestCase):
         prices = synthetic_directional_prices()
         data_dir = fresh_test_dir("artifacts/test_runner/directional")
 
-        with patch("pairs_trading.cli.CachedParquetProvider.get_close_prices", return_value=prices):
+        with patch("pairs_trading.apps.cli.CachedParquetProvider.get_close_prices", return_value=prices):
             output = run_directional_pipeline(
                 strategy_name="ma_cross",
                 symbols=["TREND", "MEAN", "BREAK"],

@@ -2,21 +2,40 @@ from __future__ import annotations
 
 import unittest
 
-from pairs_trading.backtesting import CostModel, WalkForwardBacktester, WalkForwardConfig
+from pairs_trading.engines.backtesting import CostModel, WalkForwardBacktester, WalkForwardConfig
 from pairs_trading.pipelines import DirectionalPipelineConfig, DirectionalStrategyPipeline
-from pairs_trading.portfolio import PortfolioManager
-from pairs_trading.strategies import DonchianBreakoutStrategy, MovingAverageCrossStrategy, RSIMeanReversionStrategy
+from pairs_trading.core.portfolio import PortfolioManager
+from pairs_trading.strategies import (
+    AdaptiveRegimeStrategy,
+    BollingerBandMeanReversionStrategy,
+    BuyAndHoldStrategy,
+    DonchianBreakoutStrategy,
+    EMACrossStrategy,
+    KeltnerChannelBreakoutStrategy,
+    MACDTrendStrategy,
+    MovingAverageCrossStrategy,
+    PriceSMADeviationStrategy,
+    RSIMeanReversionStrategy,
+    StochasticOscillatorStrategy,
+    TimeSeriesMomentumStrategy,
+    VolatilityTargetTrendStrategy,
+)
 from tests.common import fresh_test_dir, synthetic_directional_prices
 
 
 class DirectionalStrategyTests(unittest.TestCase):
+    def assertStandardDirectionalOutput(self, output) -> None:
+        for column in ("signal", "forecast", "position", "cost_estimate", "unit_return", "gross_return"):
+            self.assertIn(column, output.frame.columns)
+            self.assertFalse(output.frame[column].isna().any(), column)
+        self.assertIn("strategy_type", output.diagnostics)
+
     def test_moving_average_cross_emits_standardized_output(self) -> None:
         prices = synthetic_directional_prices()
         strategy = MovingAverageCrossStrategy(symbol="TREND", fast_window=15, slow_window=60)
         output = strategy.run_fold(train_data=prices.iloc[:300][["TREND"]], test_data=prices.iloc[300:380][["TREND"]])
 
-        self.assertIn("unit_return", output.frame.columns)
-        self.assertIn("gross_return", output.frame.columns)
+        self.assertStandardDirectionalOutput(output)
         self.assertGreater(float(output.frame["forecast"].abs().sum()), 0.0)
         self.assertGreater(float(output.frame["position"].abs().sum()), 0.0)
 
@@ -30,6 +49,31 @@ class DirectionalStrategyTests(unittest.TestCase):
 
         self.assertGreater(float(rsi_output.frame["position"].abs().sum()), 0.0)
         self.assertGreater(float(breakout_output.frame["position"].abs().sum()), 0.0)
+
+    def test_new_directional_strategies_emit_standardized_outputs(self) -> None:
+        prices = synthetic_directional_prices()
+        strategies = [
+            BuyAndHoldStrategy(symbol="TREND"),
+            EMACrossStrategy(symbol="TREND", fast_window=10, slow_window=35),
+            PriceSMADeviationStrategy(symbol="MEAN", window=25, entry_z=0.9),
+            StochasticOscillatorStrategy(symbol="MEAN", window=12, lower_entry=30.0, upper_entry=70.0),
+            BollingerBandMeanReversionStrategy(symbol="MEAN", window=20, num_std=1.4),
+            MACDTrendStrategy(symbol="TREND", fast_window=8, slow_window=24, signal_window=6),
+            KeltnerChannelBreakoutStrategy(symbol="BREAK", window=25, atr_multiplier=0.8),
+            VolatilityTargetTrendStrategy(symbol="TREND", trend_window=70, volatility_window=15),
+            TimeSeriesMomentumStrategy(symbol="TREND", lookbacks=(21, 63, 126)),
+            AdaptiveRegimeStrategy(symbol="MEAN", fast_window=20, slow_window=70, mean_reversion_window=25, volatility_window=20),
+        ]
+
+        active_position_count = 0
+        for strategy in strategies:
+            symbol = strategy.symbol
+            output = strategy.run_fold(train_data=prices.iloc[:360][[symbol]], test_data=prices.iloc[360:520][[symbol]])
+            self.assertStandardDirectionalOutput(output)
+            self.assertGreater(float(output.frame["forecast"].abs().sum()), 0.0, output.name)
+            active_position_count += int(float(output.frame["position"].abs().sum()) > 0.0)
+
+        self.assertGreaterEqual(active_position_count, 8)
 
 
 class DirectionalPipelineTests(unittest.TestCase):

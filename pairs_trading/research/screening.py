@@ -9,8 +9,8 @@ import pandas as pd
 import statsmodels.api as sm
 from statsmodels.tsa.stattools import coint
 
-from .framework import estimate_half_life
-from .market_data import CachedParquetProvider, MarketDataProvider, YahooFinanceProvider
+from ..core.framework import estimate_half_life
+from ..data.market import CachedParquetProvider, MarketDataProvider, YahooFinanceProvider
 
 
 @dataclass(frozen=True)

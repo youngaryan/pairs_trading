@@ -1,0 +1,557 @@
+from __future__ import annotations
+
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from concurrent.futures import Future, ThreadPoolExecutor
+import json
+from pathlib import Path
+from threading import Lock
+from typing import Any
+from uuid import uuid4
+
+from ..api import build_paper_dashboard_payload
+from ..apps.cli import (
+    DIRECTIONAL_PIPELINES,
+    json_ready,
+    run_directional_pipeline,
+    run_etf_trend_pipeline,
+    run_event_driven_pipeline,
+    run_stat_arb_pipeline,
+)
+from ..operations.paper_trading import run_paper_batch
+from .config import BackendSettings
+from .schemas import BacktestRunRequest
+
+
+@dataclass(frozen=True)
+class PaperRunCommand:
+    deployment_config_path: Path | None = None
+    asof_date: str | None = None
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+
+
+def _safe_metric(mapping: dict[str, Any], key: str) -> float | None:
+    value = mapping.get(key)
+    try:
+        return None if value is None else float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _equity_curve_points(equity_curve: Any, *, max_points: int = 500) -> list[dict[str, float | str]]:
+    if not hasattr(equity_curve, "empty") or equity_curve.empty or "net_return" not in equity_curve.columns:
+        return []
+    frame = equity_curve.copy()
+    net_returns = frame["net_return"].fillna(0.0)
+    equity = (1.0 + net_returns).cumprod()
+    drawdown = equity / equity.cummax() - 1.0
+    sampled = frame.assign(_equity=equity, _drawdown=drawdown, _net_return=net_returns).tail(max_points)
+    points: list[dict[str, float | str]] = []
+    for timestamp, row in sampled.iterrows():
+        points.append(
+            {
+                "timestamp": timestamp.isoformat() if hasattr(timestamp, "isoformat") else str(timestamp),
+                "equity": float(row["_equity"]),
+                "drawdown": float(row["_drawdown"]),
+                "net_return": float(row["_net_return"]),
+            }
+        )
+    return points
+
+
+def _decision_report(summary: dict[str, Any], validation: dict[str, Any]) -> dict[str, Any]:
+    checks: list[dict[str, Any]] = []
+
+    def add_check(name: str, value: float | None, passed: bool, message: str) -> None:
+        checks.append({"name": name, "value": value, "passed": passed, "message": message})
+
+    sharpe = _safe_metric(summary, "sharpe")
+    dsr = _safe_metric(validation, "dsr")
+    pbo = _safe_metric(validation, "pbo")
+    max_drawdown = _safe_metric(summary, "max_drawdown")
+    avg_turnover = _safe_metric(summary, "avg_turnover")
+    folds = _safe_metric(summary, "folds")
+
+    add_check("Sharpe", sharpe, sharpe is not None and sharpe >= 1.0, "Prefer Sharpe above 1.0 after costs.")
+    add_check("DSR", dsr, dsr is not None and dsr >= 0.60, "DSR adjusts for multiple testing and non-normality.")
+    add_check("PBO", pbo, pbo is not None and pbo <= 0.30, "Lower PBO means lower estimated overfitting risk.")
+    add_check("Drawdown", max_drawdown, max_drawdown is not None and max_drawdown >= -0.25, "Large drawdowns can make live trading impossible.")
+    add_check("Turnover", avg_turnover, avg_turnover is not None and avg_turnover <= 1.50, "High turnover is fragile after slippage and spread.")
+    add_check("Folds", folds, folds is not None and folds >= 3.0, "More walk-forward folds make the estimate less brittle.")
+
+    passed_count = sum(1 for check in checks if check["passed"])
+    if passed_count >= 5:
+        verdict = "paper_candidate"
+        headline = "Candidate for shadow paper trading"
+    elif passed_count >= 3:
+        verdict = "research_more"
+        headline = "Promising but needs more research"
+    else:
+        verdict = "reject_or_redesign"
+        headline = "Do not promote yet"
+
+    return {
+        "verdict": verdict,
+        "headline": headline,
+        "passed_checks": passed_count,
+        "total_checks": len(checks),
+        "checks": checks,
+    }
+
+
+def _result_payload(run_output: dict[str, Any]) -> dict[str, Any]:
+    result = run_output.get("result")
+    artifact_dir = getattr(result, "artifact_dir", None)
+    fold_metrics = getattr(result, "fold_metrics", None)
+    equity_curve = getattr(result, "equity_curve", None)
+    summary = json_ready(run_output.get("summary", {}))
+    validation = json_ready(run_output.get("validation", {}))
+    return {
+        "summary": summary,
+        "validation": validation,
+        "visuals": json_ready(run_output.get("visuals", {})),
+        "artifact_dir": str(artifact_dir) if artifact_dir is not None else None,
+        "fold_metrics_tail": json_ready(fold_metrics.tail(12)) if hasattr(fold_metrics, "tail") else [],
+        "equity_curve_tail": json_ready(equity_curve.tail(80)) if hasattr(equity_curve, "tail") else [],
+        "equity_curve_points": _equity_curve_points(equity_curve),
+        "decision": _decision_report(summary, validation),
+    }
+
+
+def _clean_parameters(parameters: dict[str, Any]) -> dict[str, Any]:
+    return {str(key): value for key, value in parameters.items() if value is not None}
+
+
+@dataclass
+class BacktestJob:
+    id: str
+    status: str
+    request: dict[str, Any]
+    created_at_utc: str
+    updated_at_utc: str
+    progress: float = 0.0
+    stage: str = "queued"
+    message: str = "Waiting for a worker."
+    warnings: list[str] = field(default_factory=list)
+    started_at_utc: str | None = None
+    finished_at_utc: str | None = None
+    result: dict[str, Any] | None = None
+    error: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "status": self.status,
+            "request": self.request,
+            "created_at_utc": self.created_at_utc,
+            "updated_at_utc": self.updated_at_utc,
+            "progress": self.progress,
+            "stage": self.stage,
+            "message": self.message,
+            "warnings": self.warnings,
+            "started_at_utc": self.started_at_utc,
+            "finished_at_utc": self.finished_at_utc,
+            "result": self.result,
+            "error": self.error,
+        }
+
+
+class BacktestJobRunner:
+    def __init__(self, settings: BackendSettings, *, max_workers: int = 2, max_history: int = 50) -> None:
+        self.settings = settings
+        self.max_history = max_history
+        self.executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="backtest-agent")
+        self.lock = Lock()
+        self.jobs: dict[str, BacktestJob] = {}
+        self.jobs_dir = settings.backtest_job_state_dir
+        self.jobs_dir.mkdir(parents=True, exist_ok=True)
+        self._load_jobs()
+
+    def submit(self, request: BacktestRunRequest) -> dict[str, Any]:
+        BacktestService(self.settings).validate_request(request)
+        now = _utc_now_iso()
+        job = BacktestJob(
+            id=uuid4().hex,
+            status="queued",
+            request=json_ready(request.model_dump(mode="json")),
+            created_at_utc=now,
+            updated_at_utc=now,
+            progress=0.02,
+            stage="queued",
+            message="Queued locally. A backtest worker will pick this up next.",
+        )
+        with self.lock:
+            self.jobs[job.id] = job
+            self._save_locked(job)
+            self._trim_locked()
+
+        future = self.executor.submit(self._run_job, job.id, request)
+        future.add_done_callback(lambda completed: self._finalize_unhandled(job.id, completed))
+        return job.to_dict()
+
+    def list_jobs(self) -> list[dict[str, Any]]:
+        with self.lock:
+            return [
+                job.to_dict()
+                for job in sorted(self.jobs.values(), key=lambda item: item.created_at_utc, reverse=True)
+            ]
+
+    def get_job(self, job_id: str) -> dict[str, Any] | None:
+        with self.lock:
+            job = self.jobs.get(job_id)
+            return None if job is None else job.to_dict()
+
+    def _set_status(self, job_id: str, status: str, **updates: Any) -> None:
+        now = _utc_now_iso()
+        with self.lock:
+            job = self.jobs[job_id]
+            job.status = status
+            job.updated_at_utc = now
+            for key, value in updates.items():
+                setattr(job, key, value)
+            self._save_locked(job)
+
+    def _run_job(self, job_id: str, request: BacktestRunRequest) -> None:
+        def progress(stage: str, message: str, value: float) -> None:
+            self._set_status(
+                job_id,
+                "running",
+                stage=stage,
+                message=message,
+                progress=float(max(0.0, min(value, 0.98))),
+            )
+
+        self._set_status(
+            job_id,
+            "running",
+            started_at_utc=_utc_now_iso(),
+            stage="starting",
+            message="Worker started. Validating inputs and preparing the strategy.",
+            progress=0.08,
+        )
+        try:
+            result = BacktestService(self.settings).run_backtest(request, progress=progress)
+        except Exception as exc:  # pragma: no cover - exercised through API tests
+            self._set_status(
+                job_id,
+                "failed",
+                error=str(exc),
+                finished_at_utc=_utc_now_iso(),
+                progress=1.0,
+                stage="failed",
+                message="The backtest failed. Review the error and inputs.",
+            )
+            return
+        self._set_status(
+            job_id,
+            "completed",
+            result=result,
+            finished_at_utc=_utc_now_iso(),
+            progress=1.0,
+            stage="completed",
+            message="Backtest completed. Review validation before promoting to paper trading.",
+        )
+
+    def _finalize_unhandled(self, job_id: str, future: Future[None]) -> None:
+        exception = future.exception()
+        if exception is None:
+            return
+        self._set_status(
+            job_id,
+            "failed",
+            error=str(exception),
+            finished_at_utc=_utc_now_iso(),
+            progress=1.0,
+            stage="failed",
+            message="The worker crashed before returning a result.",
+        )
+
+    def _trim_locked(self) -> None:
+        if len(self.jobs) <= self.max_history:
+            return
+        removable = sorted(self.jobs.values(), key=lambda item: item.created_at_utc)[: len(self.jobs) - self.max_history]
+        for job in removable:
+            self.jobs.pop(job.id, None)
+            try:
+                (self.jobs_dir / f"{job.id}.json").unlink()
+            except FileNotFoundError:
+                pass
+
+    def _save_locked(self, job: BacktestJob) -> None:
+        path = self.jobs_dir / f"{job.id}.json"
+        tmp_path = path.with_suffix(".tmp")
+        tmp_path.write_text(json.dumps(json_ready(job.to_dict()), indent=2), encoding="utf-8")
+        tmp_path.replace(path)
+
+    def _load_jobs(self) -> None:
+        for path in sorted(self.jobs_dir.glob("*.json")):
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                job = BacktestJob(**payload)
+            except Exception:
+                continue
+            if job.status in {"queued", "running"}:
+                job.status = "interrupted"
+                job.stage = "interrupted"
+                job.progress = 1.0
+                job.message = "The backend restarted before this job finished. Please rerun it."
+                job.finished_at_utc = job.finished_at_utc or _utc_now_iso()
+            self.jobs[job.id] = job
+
+
+class BacktestService:
+    def __init__(self, settings: BackendSettings) -> None:
+        self.settings = settings
+
+    def validate_request(self, request: BacktestRunRequest) -> None:
+        if not request.pipeline:
+            raise ValueError("Choose a pipeline before launching a backtest.")
+        if request.pipeline in (set(DIRECTIONAL_PIPELINES) | {"etf_trend", "edgar_event"}) and not request.symbols:
+            raise ValueError("This pipeline requires at least one symbol.")
+        if request.pipeline == "edgar_event" and not request.event_file and not request.use_sec_companyfacts:
+            raise ValueError("EDGAR event backtests require an event file or SEC company facts settings.")
+        if request.pipeline == "stat_arb" and request.symbols and request.sector_map_path is None:
+            # The stat-arb runner can use its default sector map, but user-supplied symbols would be ignored.
+            raise ValueError("Stat-arb symbol lists require a sector map path so sectors are explicit.")
+        if request.train_bars <= request.purge_bars + 5:
+            raise ValueError("Training bars must be meaningfully larger than purge bars.")
+
+    def run_backtest(
+        self,
+        request: BacktestRunRequest,
+        progress: Callable[[str, str, float], None] | None = None,
+    ) -> dict[str, Any]:
+        def report(stage: str, message: str, value: float) -> None:
+            if progress is not None:
+                progress(stage, message, value)
+
+        self.validate_request(request)
+        pipeline = request.pipeline
+        params = _clean_parameters(request.parameters)
+        artifact_root = str(request.artifact_root or self.settings.backtest_artifact_root)
+        experiment_name = request.experiment_name or f"{pipeline}_ui"
+
+        if pipeline in DIRECTIONAL_PIPELINES:
+            report("running_directional", f"Running {pipeline} across {len(request.symbols)} symbols.", 0.22)
+            run_output = run_directional_pipeline(
+                strategy_name=pipeline,
+                symbols=request.symbols,
+                start=request.start,
+                end=request.end,
+                interval=request.interval,
+                experiment_name=experiment_name,
+                price_cache_dir=str(self.settings.price_cache_dir),
+                artifact_root=artifact_root,
+                train_bars=request.train_bars,
+                test_bars=request.test_bars,
+                step_bars=request.step_bars,
+                bars_per_year=request.bars_per_year,
+                fast_window=int(params.get("fast_window", 20)),
+                slow_window=int(params.get("slow_window", 80)),
+                ema_fast_window=int(params.get("ema_fast_window", 12)),
+                ema_slow_window=int(params.get("ema_slow_window", 48)),
+                rsi_window=int(params.get("rsi_window", 14)),
+                lower_entry=float(params.get("lower_entry", 30.0)),
+                upper_entry=float(params.get("upper_entry", 70.0)),
+                exit_level=float(params.get("exit_level", 50.0)),
+                sma_window=int(params.get("sma_window", 40)),
+                z_entry=float(params.get("z_entry", 1.25)),
+                z_exit=float(params.get("z_exit", 0.25)),
+                stochastic_window=int(params.get("stochastic_window", 14)),
+                stochastic_smooth_window=int(params.get("stochastic_smooth_window", 3)),
+                stochastic_lower_entry=float(params.get("stochastic_lower_entry", 20.0)),
+                stochastic_upper_entry=float(params.get("stochastic_upper_entry", 80.0)),
+                bollinger_window=int(params.get("bollinger_window", 20)),
+                bollinger_num_std=float(params.get("bollinger_num_std", 2.0)),
+                macd_fast_window=int(params.get("macd_fast_window", 12)),
+                macd_slow_window=int(params.get("macd_slow_window", 26)),
+                macd_signal_window=int(params.get("macd_signal_window", 9)),
+                breakout_window=int(params.get("breakout_window", 55)),
+                breakout_exit_window=int(params.get("breakout_exit_window", 20)),
+                keltner_window=int(params.get("keltner_window", 40)),
+                keltner_atr_multiplier=float(params.get("keltner_atr_multiplier", 1.5)),
+                trend_window=int(params.get("trend_window", 120)),
+                volatility_window=int(params.get("volatility_window", 20)),
+                target_volatility=float(params.get("target_volatility", 0.15)),
+                max_position=float(params.get("max_position", 1.5)),
+                momentum_lookbacks=params.get("momentum_lookbacks"),
+                momentum_min_agreement=float(params.get("momentum_min_agreement", 0.25)),
+                regime_fast_window=int(params.get("regime_fast_window", 30)),
+                regime_slow_window=int(params.get("regime_slow_window", 120)),
+                regime_mean_reversion_window=int(params.get("regime_mean_reversion_window", 40)),
+                regime_volatility_window=int(params.get("regime_volatility_window", 30)),
+                regime_volatility_quantile=float(params.get("regime_volatility_quantile", 0.70)),
+                strategy_cost_bps=float(params.get("strategy_cost_bps", 2.0)),
+                purge_bars=request.purge_bars,
+                embargo_bars=request.embargo_bars,
+                pbo_partitions=request.pbo_partitions,
+            )
+            report("collecting_results", "Backtest finished. Building charts and validation summary.", 0.92)
+            return _result_payload(run_output)
+
+        if pipeline == "etf_trend":
+            report("running_etf_trend", f"Running ETF trend agent across {len(request.symbols)} symbols.", 0.22)
+            run_output = run_etf_trend_pipeline(
+                symbols=request.symbols,
+                start=request.start,
+                end=request.end,
+                interval=request.interval,
+                experiment_name=experiment_name,
+                price_cache_dir=str(self.settings.price_cache_dir),
+                artifact_root=artifact_root,
+                purge_bars=request.purge_bars,
+                embargo_bars=request.embargo_bars,
+                pbo_partitions=request.pbo_partitions,
+            )
+            report("collecting_results", "Backtest finished. Building charts and validation summary.", 0.92)
+            return _result_payload(run_output)
+
+        if pipeline == "stat_arb":
+            report("running_stat_arb", "Running sector-neutral stat-arb agent.", 0.22)
+            run_output = run_stat_arb_pipeline(
+                sector_map_path=str(request.sector_map_path) if request.sector_map_path else None,
+                start=request.start,
+                end=request.end,
+                interval=request.interval,
+                experiment_name=experiment_name,
+                price_cache_dir=str(self.settings.price_cache_dir),
+                sentiment_cache_dir=str(self.settings.sentiment_cache_dir),
+                artifact_root=artifact_root,
+                daily_sentiment_file=str(params["daily_sentiment_file"]) if params.get("daily_sentiment_file") else None,
+                purge_bars=request.purge_bars,
+                embargo_bars=request.embargo_bars,
+                pbo_partitions=request.pbo_partitions,
+            )
+            report("collecting_results", "Backtest finished. Building charts and validation summary.", 0.92)
+            return _result_payload(run_output)
+
+        if pipeline == "edgar_event":
+            report("running_events", "Running event-driven EDGAR agent.", 0.22)
+            run_output = run_event_driven_pipeline(
+                symbols=request.symbols,
+                start=request.start,
+                end=request.end,
+                interval=request.interval,
+                experiment_name=experiment_name,
+                price_cache_dir=str(self.settings.price_cache_dir),
+                event_cache_dir=str(self.settings.event_cache_dir),
+                artifact_root=artifact_root,
+                event_file=str(request.event_file) if request.event_file else None,
+                edgar_user_agent=request.edgar_user_agent,
+                use_sec_companyfacts=request.use_sec_companyfacts,
+                purge_bars=request.purge_bars,
+                embargo_bars=request.embargo_bars,
+                pbo_partitions=request.pbo_partitions,
+            )
+            report("collecting_results", "Backtest finished. Building charts and validation summary.", 0.92)
+            return _result_payload(run_output)
+
+        raise ValueError(f"Unsupported backtest pipeline: {pipeline}")
+
+    @staticmethod
+    def templates() -> list[dict[str, Any]]:
+        return [
+            {
+                "id": "trend_agent",
+                "name": "ETF Momentum Agent",
+                "pipeline": "etf_trend",
+                "symbols": ["SPY", "QQQ", "IWM", "TLT", "GLD", "XLK"],
+                "start": "2015-01-01",
+                "end": "2026-04-15",
+                "parameters": {},
+                "description": "Clean first sleeve: liquid ETFs, momentum rotation, and realistic validation.",
+                "objective": "Find a robust liquid ETF rotation candidate.",
+                "risk_level": "Medium",
+                "validation_focus": "DSR, PBO, drawdown, turnover, and sensitivity to rebalance cadence.",
+            },
+            {
+                "id": "vol_target_agent",
+                "name": "Volatility Target Trend Agent",
+                "pipeline": "volatility_target_trend",
+                "symbols": ["SPY", "QQQ", "TLT", "GLD"],
+                "start": "2015-01-01",
+                "end": "2026-04-15",
+                "parameters": {"trend_window": 120, "volatility_window": 20, "target_volatility": 0.15},
+                "description": "Directional trend model with dynamic risk scaling.",
+                "objective": "Test whether volatility scaling improves trend-following stability.",
+                "risk_level": "Medium",
+                "validation_focus": "Drawdown control, turnover, and whether DSR survives nearby parameter changes.",
+            },
+            {
+                "id": "reversion_agent",
+                "name": "Bollinger Reversion Agent",
+                "pipeline": "bollinger_mean_reversion",
+                "symbols": ["SPY", "QQQ", "IWM"],
+                "start": "2018-01-01",
+                "end": "2026-04-15",
+                "parameters": {"bollinger_window": 20, "bollinger_num_std": 2.0, "z_exit": 0.25},
+                "description": "Mean-reversion lab for range-bound behavior.",
+                "objective": "Test short-term reversion behavior against noisy ETF ranges.",
+                "risk_level": "Medium-high",
+                "validation_focus": "False breakouts, transaction costs, and drawdown during trend regimes.",
+            },
+            {
+                "id": "adaptive_agent",
+                "name": "Adaptive Regime Agent",
+                "pipeline": "adaptive_regime",
+                "symbols": ["SPY", "QQQ", "IWM", "TLT"],
+                "start": "2015-01-01",
+                "end": "2026-04-15",
+                "parameters": {"regime_fast_window": 30, "regime_slow_window": 120, "regime_volatility_quantile": 0.7},
+                "description": "Advanced regime switcher that alternates trend and mean-reversion behavior.",
+                "objective": "Evaluate whether regime switching adds value after validation penalties.",
+                "risk_level": "High",
+                "validation_focus": "Overfitting risk, PBO, and stability across market regimes.",
+            },
+        ]
+
+
+class PaperService:
+    def __init__(self, settings: BackendSettings) -> None:
+        self.settings = settings
+
+    def latest_batch_summary_path(self) -> Path | None:
+        root = self.settings.paper_artifact_root
+        if not root.exists():
+            return None
+        candidates = list(root.glob("*_paper_batch/paper_batch_summary.json"))
+        if not candidates:
+            return None
+        return max(candidates, key=lambda path: path.stat().st_mtime)
+
+    def build_dashboard_payload(self, batch_summary_path: str | Path | None = None) -> dict[str, Any]:
+        summary_path = Path(batch_summary_path) if batch_summary_path else self.latest_batch_summary_path()
+        return build_paper_dashboard_payload(
+            state_dir=self.settings.paper_state_dir,
+            batch_summary_path=summary_path,
+        )
+
+    def list_strategies(self, batch_summary_path: str | Path | None = None) -> list[dict[str, Any]]:
+        return list(self.build_dashboard_payload(batch_summary_path=batch_summary_path).get("strategies", []))
+
+    def get_strategy(self, strategy_name: str, batch_summary_path: str | Path | None = None) -> dict[str, Any] | None:
+        normalized = strategy_name.casefold()
+        for strategy in self.list_strategies(batch_summary_path=batch_summary_path):
+            if str(strategy.get("name", "")).casefold() == normalized:
+                return strategy
+        return None
+
+    def run_paper_batch(self, command: PaperRunCommand) -> dict[str, Any]:
+        config_path = command.deployment_config_path or self.settings.default_paper_config
+        if not config_path.exists():
+            raise FileNotFoundError(f"Paper deployment config not found: {config_path}")
+
+        summary = run_paper_batch(
+            deployment_config_path=config_path,
+            asof_date=command.asof_date,
+            state_dir=self.settings.paper_state_dir,
+            artifact_root=self.settings.paper_artifact_root,
+            price_cache_dir=str(self.settings.price_cache_dir),
+            sentiment_cache_dir=str(self.settings.sentiment_cache_dir),
+            event_cache_dir=str(self.settings.event_cache_dir),
+        )
+        return self.build_dashboard_payload(batch_summary_path=summary.get("artifact_dir") and Path(summary["artifact_dir"]) / "paper_batch_summary.json")

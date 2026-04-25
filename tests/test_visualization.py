@@ -5,9 +5,9 @@ import unittest
 
 import pandas as pd
 
-from pairs_trading.backtesting import ExperimentResult
+from pairs_trading.engines.backtesting import ExperimentResult
 from tests.common import fresh_test_dir
-from pairs_trading.visualization import ExperimentVisualizer
+from pairs_trading.reporting.experiment import ExperimentVisualizer
 
 
 class VisualizationTests(unittest.TestCase):

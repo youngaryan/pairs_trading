@@ -15,7 +15,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from .backtesting import ExperimentResult, json_ready
+from ..engines.backtesting import ExperimentResult, json_ready
 
 
 CHART_DESCRIPTIONS = {

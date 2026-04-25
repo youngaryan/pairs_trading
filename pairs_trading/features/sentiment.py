@@ -11,7 +11,7 @@ from typing import Iterable, Sequence
 import numpy as np
 import pandas as pd
 
-from .framework import StrategyOutput
+from ..core.framework import StrategyOutput
 
 
 @dataclass(frozen=True)

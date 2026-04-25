@@ -6,7 +6,7 @@ from typing import Sequence
 import numpy as np
 import pandas as pd
 
-from ..framework import StrategyOutput, WalkForwardStrategy
+from ..core.framework import StrategyOutput, WalkForwardStrategy
 
 
 @dataclass(frozen=True)
